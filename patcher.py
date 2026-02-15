@@ -1,5 +1,6 @@
 from __future__ import annotations
 import random
+import re
 
 _VANILLA_ROOT = None  # set in main()
 import json
@@ -125,6 +126,56 @@ def write_tsv(path: Path, header, data, newline="\n"):
         for r in data:
             w.writerow([r.get(h, "") for h in header])
 
+
+
+
+def patch_monstats_cow_xp_boost(mod_root, report, mult=100):
+    """Increase XP for Cow Level monsters (hellbovine, cowking) via monstats.txt only.
+
+    - Scope: Classic-safe; does not touch levels/treasure classes/experience curve.
+    - Moderate default: 10x.
+    """
+    from pathlib import Path
+
+    p = mod_root / "data/global/excel/monstats.txt"
+    if not p.exists():
+        report.append(f"[cow-xp] monstats.txt not found at: {p} (skipped)")
+        return
+
+    h, rows, nl = read_tsv(p)
+
+    # Identify Exp columns (D2 convention)
+    exp_cols = [c for c in ("Exp", "Exp(N)", "Exp(H)") if c in h]
+    if not exp_cols:
+        exp_cols = [c for c in h if c.lower().startswith("exp")]
+    if not exp_cols:
+        report.append("[cow-xp] No Exp columns found in monstats.txt (skipped)")
+        return
+
+    targets = {"hellbovine", "cowking"}
+    changed_rows = 0
+    changed_cells = 0
+
+    for r in rows:
+        mid = (r.get("Id") or r.get("id") or "").strip().lower()
+        if mid not in targets:
+            continue
+        row_changed = False
+        for c in exp_cols:
+            v = (r.get(c) or "").strip()
+            if not v or not re.fullmatch(r"-?\d+", v):
+                continue
+            iv = int(v)
+            nv = iv * int(mult)
+            if str(nv) != v:
+                r[c] = str(nv)
+                changed_cells += 1
+                row_changed = True
+        if row_changed:
+            changed_rows += 1
+
+    write_tsv(p, h, rows, nl)
+    report.append(f"[cow-xp] Increased cow monster XP in monstats.txt by x{mult} (rows: {changed_rows}, cells: {changed_cells})")
 
 def patch_charstats_from_reference(mod_root: Path, patch_sources: Path, log_lines: list[str]) -> None:
     """
@@ -2196,6 +2247,7 @@ def main():
     # 3) Apply locked patches to the mod root (vanilla schema already seeded)
     patch_misc_toa_version0(mod_root, report)
     patch_uniqueitems_force_max_rolls(mod_root, report)
+    patch_monstats_cow_xp_boost(mod_root, report, mult=100)
     # --- Classic Elite Port: Shako base + Harlequin Crest + Cow Level incentive drop ---
     apply_classic_enable_shako_base(mod_root, report)
     apply_classic_enable_ancient_sword_base(mod_root, report)
