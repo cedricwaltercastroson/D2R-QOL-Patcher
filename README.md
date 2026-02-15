@@ -3,7 +3,7 @@
 
 ## Base Game Version
 Built and validated against:
-Diablo II Resurrected Classic Offline — v1.6.x series
+Diablo II Resurrected Classic Offline — v1.4.71776
 
 ---
 
