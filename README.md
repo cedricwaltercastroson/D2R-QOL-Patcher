@@ -123,3 +123,59 @@ python patcher.py --vanilla "C:\vanilla" --out "C:\output" --cowtest
 ### Cow Level XP Boost (monstats-only)
 - Cow monsters (Hell Bovine, Cow King) grant **10× XP** by patching `monstats.txt` only.
 - No changes to drop tables, area level, or global experience curves.
+
+
+---
+
+## PatchR76 — Legacy Tyrael/Chaos cleanup (no behavior change)
+
+**Date:** 2026-02-15
+
+### Cleanup
+- Removed legacy Tyrael/Chaos Armor remap stubs and misleading report lines:
+  - Removed `[tyrael] legacy remap assignment removed...`
+  - Removed `[tyrael] Legacy Goldskin->Tyrael repurpose assertion skipped...`
+- Removed unused Chaos Armor host logic (`[chaos]` tagged functions).
+- Kept active Tyrael hosting on **Sacred Armor (uar)** unchanged.
+
+
+---
+
+## PatchR78 — Dead code pruning pass (safe)
+
+**Date:** 2026-02-16
+
+### What changed
+- Removed unreferenced legacy/disabled helper functions (name/docstring flagged) to reduce maintenance surface.
+- No intended gameplay/logic changes.
+- No TSV row ordering changes.
+
+
+---
+
+## PatchR79 — UI overrides toggle (disabled by default)
+
+**Date:** 2026-02-16
+
+### What changed
+- Added `--enable-ui` flag.
+- Default behavior: UI layout overrides are copied then renamed to:
+  - `disable_profilehd.json`
+  - `disable_profilelv.json`
+  - `disable_profilesd.json`
+  - `disableglobaldata.json`
+  - `disableglobaldatahd.json`
+  This prevents the game from loading them unless explicitly enabled.
+
+
+---
+
+## PatchR80 — patch.bat UI toggle parity
+
+**Date:** 2026-02-17
+
+### What changed
+- Updated `patch.bat` to provide CowTest + UI toggle parity using environment switches:
+  - `set COWTEST=1` enables Cow Level test drop injection (`--cowtest`)
+  - `set UITEST=1` enables UI layout overrides (`--enable-ui`)
+- Default (`0/0`) behavior remains unchanged.

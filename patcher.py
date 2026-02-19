@@ -127,9 +127,7 @@ def write_tsv(path: Path, header, data, newline="\n"):
             w.writerow([r.get(h, "") for h in header])
 
 
-
-
-def patch_monstats_cow_xp_boost(mod_root, report, mult=100):
+def patch_monstats_cow_xp_boost(mod_root, report, mult=9999):
     """Increase XP for Cow Level monsters (hellbovine, cowking) via monstats.txt only.
 
     - Scope: Classic-safe; does not touch levels/treasure classes/experience curve.
@@ -362,7 +360,6 @@ def patch_treasureclassex_andariel(mod_root: Path, report: list[str]) -> None:
     report.append(f"[treasureclassex] Andariel quest-drop patch applied: {changed_rows} row(s), {changed_cells} cell(s) updated")
 
 
-
 def patch_skills_intown_from_reference(mod_root: Path, patch_sources: Path, report: list[str]) -> None:
     """
     Minimal, version-safe Town-cast patch:
@@ -445,19 +442,6 @@ def patch_skills_intown_from_reference(mod_root: Path, patch_sources: Path, repo
     report.append(f"[skills] InTown overrides applied from skills.reference.txt: {changed_rows} row(s) updated")
 
 
-
-
-
-def apply_classic_unique_armor_remap_tyrael(*args, **kwargs):
-    """Legacy stub retained for backward compatibility; no longer used."""
-    report = None
-    if len(args) >= 2:
-        report = args[1]
-    if isinstance(report, list):
-        report.append("[tyrael] legacy remap stub invoked; no-op.")
-    return False
-
-
 def patch_uniqueitems_force_max_rolls(mod_root: Path, report: list[str]) -> None:
     """
     Force ALL Unique items to roll their maximum ranged stats (Classic-safe).
@@ -481,12 +465,7 @@ def patch_uniqueitems_force_max_rolls(mod_root: Path, report: list[str]) -> None
 
     # --- Guarded Atlantean enablement (deterministic) ---
     # Port 'The Atlantean' into Classic by adding a new Ancient Sword (ans) unique row (no replacement needed).
-    # --- Guarded Classic Tyrael enablement (deterministic) ---
-    # Strict post-condition: abort rather than silently degrading back to Venomsward.
-    report.append("[tyrael] legacy remap assignment removed (function deleted).")
-    tyrael_guard_applied = False
-    if not tyrael_guard_applied:
-        report.append("[tyrael] Legacy Goldskin->Tyrael repurpose assertion skipped (Tyrael hosted via Chaos Armor restore).")
+    # [tyrael] Legacy Chaos/Goldskin remap system removed (Tyrael hosted on Sacred Armor uar).
 
     min_cols = [c for c in h if c.lower().startswith("min") and c[3:].isdigit()]
     if not min_cols:
@@ -671,10 +650,6 @@ def patch_automagic_force_max_rolls(mod_root: Path, report: list[str]) -> None:
     cr, cc = _force_min_equals_max(rows, h, "0")
     write_tsv(p, h, rows)
     report.append(f"[affix-max] automagic: forced max rolls (rows changed: {cr}, cells: {cc})")
-
-
-
-
 
 
 def patch_skills_holyshock_min_equals_max(mod_root: Path, report: list[str]) -> None:
@@ -1024,26 +999,52 @@ def patch_cubemain(root: Path, patch_sources: Path, report: list[str]) -> None:
     report.append(f"[cubemain] injected custom recipes (added rows: {len(to_add)})")
 
 
-
-
-
-def copy_ui_overrides(root: Path, patch_sources: Path, report: list[str]):
+def copy_ui_overrides(root: Path, patch_sources: Path, report: list[str], enable_ui: bool = False):
+    # UI override files (D2R layouts). If enable_ui is False (default), we still copy the
+    # override sources but then rename them to 'disable*' filenames so the game won't load them.
     rels = [
         "data/global/ui/layouts/_profilehd.json",
         "data/global/ui/layouts/_profilelv.json",
         "data/global/ui/layouts/_profilesd.json",
         "data/global/ui/layouts/globaldata.json",
         "data/global/ui/layouts/globaldatahd.json",
-            ]
+    ]
+
+    disabled_name_map = {
+        "_profilehd.json": "disable_profilehd.json",
+        "_profilelv.json": "disable_profilelv.json",
+        "_profilesd.json": "disable_profilesd.json",
+        "globaldata.json": "disableglobaldata.json",
+        "globaldatahd.json": "disableglobaldatahd.json",
+    }
+
     copied = 0
+    disabled = 0
+
     for rel in rels:
-        src = patch_sources/rel
-        if src.exists():
-            dst = root/rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-            copied += 1
-    report.append(f"UI/strings: copied {copied} json files from patch_sources (as-is)")
+        src_path = patch_sources / rel
+        if not src_path.exists():
+            continue
+
+        dst_path = root / rel
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_path, dst_path)
+        copied += 1
+
+        if not enable_ui:
+            # Rename to disabled filename in the same folder (removes active override by default).
+            new_name = disabled_name_map.get(dst_path.name)
+            if new_name:
+                disabled_path = dst_path.with_name(new_name)
+                if disabled_path.exists():
+                    disabled_path.unlink()
+                dst_path.rename(disabled_path)
+                disabled += 1
+
+    if enable_ui:
+        report.append(f"[ui] UI overrides enabled: copied {copied} layout json file(s) from patch_sources.")
+    else:
+        report.append(f"[ui] UI overrides disabled by default: copied {copied} file(s) then renamed {disabled} to disable* filenames.")
 
 
 def copy_static_payload(script_dir: Path, out_root: Path, log_lines: list[str]) -> None:
@@ -1125,8 +1126,6 @@ def copy_static_payload(static_root: Path, out_root: Path, mod_subroot: Path, lo
     log_lines.append(f"[static] copied static_mod into output under {out_root}")
 
 
-
-
 def sync_output_to_static(out_root: Path, script_dir: Path, mod_subroot: Path, log_lines: list[str]) -> None:
     """
     Overwrites static_mod with the final generated mod tree so static_mod always reflects
@@ -1189,7 +1188,6 @@ def verify_vanilla_item_name_key(vanilla_root: Path, key: str, report: list[str]
 
     if not verified_any:
         report.append(f"[strings] WARNING: Could not verify vanilla Key='{key}' in any item-names*.json")
-
 
 
 def apply_classic_atlantean_by_cloning_vanilla_unique(vanilla_rows, mod_rows, mod_header, report):
@@ -1290,7 +1288,6 @@ def apply_classic_enable_ancient_sword_base(mod_root, report):
     return True
 
 
-
 def apply_classic_port_harlequin_crest(mod_root, report):
     """Classic-only Shako + Harlequin + Peasant Crown normalization (no strings injection)."""
     p = mod_root / "data/global/excel/uniqueitems.txt"
@@ -1367,7 +1364,7 @@ def apply_classic_port_harlequin_crest(mod_root, report):
     rows.append(classic_peas)
 
     write_tsv(p, h, rows)
-    report.append("[unique-remap] uap->Harlequin, xap->Peas(e)nt mapping locked.")
+    report.append("[unique-lock] Canonical Classic mapping enforced: Shako(uap)->Harlequin Crest; War Hat(xap)->Peasant Crown.")
     return True
 
 
@@ -1463,7 +1460,6 @@ make_row("FORGE OVERRIDE: uar low nos + isc -> unique (deterministic)", "uar,low
     write_tsv(p, h, rows)
     report.append(f"[forge] Deterministic forge hardening inserted ({len(inserts)} rows)")
     return True
-
 
 
 def apply_remove_unique_level_requirements(mod_root, report):
@@ -1665,85 +1661,6 @@ def apply_cow_test_drop_injection(mod_root: Path, report: list[str], enabled=Tru
     report.append(f"[cow-test] Stream ({len(stream)}): {preview}")
 
 
-
-def apply_classic_port_chaos_armor_and_restore_canonical_armor(mod_root, report):
-    """Port Chaos Armor (xar) to Classic and host Tyrael's Might on xar ONLY.
-
-    This intentionally does NOT remap/clear any other Classic armor uniques (Goldskin/Venom Ward/Rattlecage),
-    relying on vanilla canonical mappings to avoid unintended broad mapping shifts.
-    """
-    # Enable Chaos Armor base (xar) for Classic
-    ap = mod_root / "data/global/excel/armor.txt"
-    if ap.exists():
-        h, rows, _ = read_tsv(ap)
-        def lc(v): return (v or "").strip().lower()
-        code_col = next((c for c in h if c.strip().lower()=="code"), None)
-        ver_col  = next((c for c in h if c.strip().lower()=="version"), None)
-        en_col   = next((c for c in h if c.strip().lower()=="enabled"), None)
-        if code_col and ver_col:
-            for r in rows:
-                if lc(r.get(code_col))=="xar":
-                    r[ver_col] = "0"
-                    if en_col: r[en_col] = "1"
-                    write_tsv(ap, h, rows)
-                    report.append("[chaos] Enabled Chaos Armor base for Classic (armor.txt code=xar)")
-                    break
-
-    # Host Tyrael on xar in uniqueitems Classic rows, without touching other armor mappings.
-    up = mod_root / "data/global/excel/uniqueitems.txt"
-    if not up.exists():
-        report.append("[chaos] uniqueitems.txt not found; skipping Tyrael xar host")
-        return False
-
-    h, rows, _ = read_tsv(up)
-    def nk(k): return (k or "").strip().lstrip("\ufeff").lower().replace(" ","")
-    idx_key = next((k for k in h if nk(k)=="index"), None)
-    code_key = next((k for k in h if nk(k)=="code"), None)
-    ver_key = next((k for k in h if nk(k)=="version"), None)
-    en_key  = next((k for k in h if nk(k)=="enabled"), None)
-    if not all([idx_key, code_key, ver_key, en_key]):
-        raise RuntimeError("PATCHER ASSERTION FAILED: uniqueitems missing required columns for Tyrael xar host.")
-
-    def lc(v): return (v or "").strip().lower()
-    def is_classic(r):
-        v=(r.get(ver_key) or "").strip()
-        return v=="" or v=="0"
-
-    # Find a Tyrael source row (prefer non-classic)
-    src_ty = None
-    for r in rows:
-        if not is_classic(r) and "tyrael" in lc(r.get(idx_key)):
-            src_ty = r
-            break
-    if src_ty is None:
-        for r in rows:
-            if "tyrael" in lc(r.get(idx_key)):
-                src_ty = r
-                break
-    if src_ty is None:
-        raise RuntimeError("PATCHER ASSERTION FAILED: Tyrael row not found in uniqueitems.")
-
-    # Remove any existing Classic Tyrael rows (wherever they currently are), then append Classic Tyrael on xar.
-    kept=[]
-    removed=0
-    for r in rows:
-        if is_classic(r) and "tyrael" in lc(r.get(idx_key)):
-            removed += 1
-            continue
-        kept.append(r)
-    rows = kept
-    if removed:
-        report.append(f"[chaos] Removed {removed} prior Classic Tyrael row(s)")
-
-    new_row = dict(src_ty)
-    new_row[ver_key] = "0"
-    new_row[code_key] = "xar"
-    new_row[en_key] = "1"
-    rows.append(new_row)
-    write_tsv(up, h, rows)
-    report.append("[chaos] Classic mapping: Tyrael's Might -> xar (no other armor remaps)")
-    return True
-
 def apply_classic_port_atlantean_unique(mod_root, report):
     """Wrapper to port The Atlantean into Classic using uniqueitems.txt in mod_root."""
     p = mod_root / "data/global/excel/uniqueitems.txt"
@@ -1930,8 +1847,6 @@ def apply_classic_host_tyrael_on_sacred_armor(mod_root, report):
     write_tsv(up, h, rows)
     report.append("[tyrael] Classic mapping: Tyrael's Might -> uar (Sacred Armor) (no other armor remaps)")
     return True
-
-
 
 
 def _uniqueitems_set_key_sync(row, index_key, name_key, value):
@@ -2179,8 +2094,6 @@ def add_low_quality_variants_cubemain(rows, header, report):
     return delta
 
 
-
-
 def apply_cow_focus_boost(tc_rows, report):
     """PatchR54: boost cowtest probabilities for targeted bases used in forge testing."""
     BOOST = {"uar", "9wd", "uap"}  # Sacred Armor, Ancient Sword, Shako
@@ -2199,6 +2112,7 @@ def main():
     ap.add_argument("--vanilla", required=True, help="Path to vanilla dump root containing data/ ...")
     ap.add_argument("--out", required=True, help="Output folder (a complete mod tree will be created here)")
     ap.add_argument("--cowtest", action="store_true", help="Enable Cow Level test drop injection (high base drops).")
+    ap.add_argument("--enable-ui", action="store_true", help="Enable UI layout json overrides (default is disabled: files are renamed to disable*).")
     ap.add_argument("--patch-sources", default=str(Path(__file__).parent/"patch_sources"),
                     help="Folder containing cubemain.txt and UI json overrides")
     args = ap.parse_args()
@@ -2247,7 +2161,7 @@ def main():
     # 3) Apply locked patches to the mod root (vanilla schema already seeded)
     patch_misc_toa_version0(mod_root, report)
     patch_uniqueitems_force_max_rolls(mod_root, report)
-    patch_monstats_cow_xp_boost(mod_root, report, mult=100)
+    patch_monstats_cow_xp_boost(mod_root, report, mult=9999)
     # --- Classic Elite Port: Shako base + Harlequin Crest + Cow Level incentive drop ---
     apply_classic_enable_shako_base(mod_root, report)
     apply_classic_enable_ancient_sword_base(mod_root, report)
@@ -2274,7 +2188,7 @@ def main():
     patch_automagic(mod_root, report)
     patch_setitems(mod_root, report)
     patch_cubemain(mod_root, patch_sources, report)
-    copy_ui_overrides(mod_root, patch_sources, report)
+    copy_ui_overrides(mod_root, patch_sources, report, enable_ui=args.enable_ui)
 
     # 4) Write run log
     sync_output_to_static(out, script_dir, mod_subroot, report)
@@ -2282,8 +2196,6 @@ def main():
     (out/"log.txt").write_text("\n".join(report), encoding="utf-8")
     print("Patched mod tree written to:", out)
     print("Log:", out/"log.txt")
-
-
 
 
 if __name__ == "__main__":
