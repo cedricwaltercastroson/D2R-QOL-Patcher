@@ -1218,6 +1218,49 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
         c = type_to_class.get((tname or "").lower(), "")
         return ("assassin" in c) or ("druid" in c)
 
+    
+    # --- Restrict cow base sampler to forge-enabled bases only ---
+    # We only want bases that actually have at least one Classic-enabled unique/set mapping (so they can be forged).
+    # This avoids accidentally enabling Expansion-only miscellany (e.g., jewels) in Classic.
+    forge_enabled_base_codes = set()
+
+    def _collect_base_codes_from_mappings(path: Path, report_tag: str):
+        if not path.exists():
+            report.append(f"[cow-all-bases] {report_tag}: {path.name} not found (skipped)")
+            return
+        hh, rows, _ = read_tsv(path)
+
+        code_k = find_column_by_name(hh, "code")
+        item_k = find_column_by_name(hh, "item")  # setitems.txt typically uses 'item' for base code
+        ver_k  = find_column_by_name(hh, "version")
+        en_k   = find_column_by_name(hh, "enabled")
+
+        base_k = code_k or item_k
+        if not base_k:
+            report.append(f"[cow-all-bases] {report_tag}: {path.name} missing code/item column (skipped)")
+            return
+
+        def _is_classic_enabled(r):
+            v = (r.get(ver_k) or "").strip() if ver_k else ""
+            e = (r.get(en_k) or "").strip() if en_k else ""
+            is_classic = (v == "" or v == "0")
+            is_enabled = (e == "" or e == "1")  # some tables leave enabled blank
+            return is_classic and is_enabled
+
+        n = 0
+        for r in rows:
+            if not _is_classic_enabled(r):
+                continue
+            c = (r.get(base_k) or "").strip().lower()
+            if c:
+                forge_enabled_base_codes.add(c)
+                n += 1
+
+        report.append(f"[cow-all-bases] {report_tag}: collected {len(forge_enabled_base_codes)} forge-enabled base code(s) so far (rows scanned: {len(rows)}, rows used: {n})")
+
+    _collect_base_codes_from_mappings(excel / "uniqueitems.txt", "uniqueitems")
+    _collect_base_codes_from_mappings(excel / "setitems.txt", "setitems")
+
     # --- Collect base codes from armor/weapons/misc (spawnable when possible)
     base_codes = {}  # code -> (type, type2)
     def ingest_base_table(path: Path):
@@ -1234,6 +1277,8 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
         for r in rows:
             c = (r.get(code_k) or "").strip().lower()
             if not c:
+                continue
+            if forge_enabled_base_codes and c not in forge_enabled_base_codes:
                 continue
             # ignore Expansion marker row(s)
             if ver_k and (r.get(ver_k) or "").strip().lower()=="expansion":
@@ -1884,6 +1929,15 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
     excluded_class_prop_tokens = {"ass", "dru"}
     excluded_class_ids = {"5": "dru", "6": "ass"}
 
+    # Skill tab IDs for LoD-only classes (Druid/Assassin). These are used by the
+    # item_addskilltab property (Properties func=10: ItemModsSetTabSkills).
+    # D2R Data Guide indicates:
+    #   15-17 = Druid (Shape Shifting / Elemental / Summoning)
+    #   18-20 = Assassin (Traps / Martial Arts / Shadow Disciplines)
+    # We exclude these so LoD-class tab-skill uniques (e.g., Earthshaker's +Elemental)
+    # do NOT get ported/enabled in Classic++ until Phase 2.
+    excluded_skilltab_ids = {"15", "16", "17", "18", "19", "20"}
+
     def is_restricted_base(code: str) -> bool:
         rec = base_index.get(code)
         if not rec:
@@ -1931,6 +1985,20 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
                 mapped = excluded_class_ids.get(parv)
                 if mapped:
                     hit_token = mapped
+                    break
+
+        # Third, tab-skill property (propN=item_addskilltab, parN = skilltab id).
+        # This is how many uniques encode "+X to <Skill Tree>" bonuses.
+        if hit_token is None:
+            for n, pc in prop_num_to_col.items():
+                tok = (r.get(pc) or "").strip().lower()
+                if tok != "item_addskilltab":
+                    continue
+                parc = par_num_to_col.get(n)
+                parv = (r.get(parc) or "").strip() if parc else ""
+                if parv in excluded_skilltab_ids:
+                    # Map to class for reporting only
+                    hit_token = "dru" if parv in {"15", "16", "17"} else "ass"
                     break
 
         if hit_token == "dru":
