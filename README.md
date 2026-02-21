@@ -31,7 +31,9 @@ Built and validated against **Diablo II: Resurrected — Classic Offline** (v1.6
 **Phase 1 (forge-only):** This patcher ports **all non-Assassin/Druid uniques** into Classic by:
 - Enabling the unique row (`version=0`, `enabled=1`) **in place** (no clones, no row reordering).
 - Enabling the corresponding **canonical base white item** for Classic in `armor.txt` / `weapons.txt` / `misc.txt` (`version=0`, `spawnable=1` where present).
-- Skipping Assassin/Druid class-locked bases/uniques (Classic original characters only).
+- Skipping Assassin/Druid content via **two filters** (Classic original characters only):
+  - Base-type class restriction (katars/pelts/etc.)
+  - Unique property filter for `ass` / `dru` class-skill tokens (catches cases like **Earthshaker** on shared weapon bases)
 
 **Why in-place?** Keeping `uniqueitems.txt` structurally identical to vanilla prevents the “jumbled uniques” corruption mode.
 
@@ -46,20 +48,9 @@ Notes:
 - Removes/normalizes level requirements where required for testing (including Tyrael’s Might).
 - Sacred Armor base requirement is forced to a low, Classic-safe value for practical testing.
 
-### Cow Level Test Mode (Toggleable)
-Enable via either:
-- CLI: `--cowtest`
-- Or environment toggle used by the batch wrapper: `set COWTEST=1`
-
-Behavior:
-- Injects **non-destructive** Cow TC boosts (does not permanently replace vanilla tables).
-- Focus boosts to speed up forging validation runs:
-  - Sacred Armor (`uar`) bases
-  - Ancient Sword (`9wd`) bases
-  - Shako bases (`uap` / War Hat family tests)
-
-Disable:
-- `set COWTEST=0` (or omit `--cowtest`) returns to standard drop behavior.
+### Cow Level Drops (Current)
+- Uses the Cow Level base sampler toggles (`--cow-all-bases` / `--cow-all-bases-full`) and Phase 2 safe integration.
+- Legacy CowTest injection has been removed as redundant.
 
 ### Misc QoL
 - Stack sizes (Classic):
@@ -78,7 +69,7 @@ Disable:
 2. TSV integrity checks (column counts, header stability).
 3. Classic ports/mapping (Shako/Sacred Armor; Classic-safe remaps).
 4. Forge recipe injection (unique + set + quality variants).
-5. Cowtest injection (only if enabled; non-destructive TC edits).
+5. Cow Level drop integration (all-bases sampler / Phase 2 safe TC fill).
 6. Maxroll post-pass (runs late so ports/remaps are included).
 7. Final sync of static assets into output.
 
@@ -105,7 +96,7 @@ Phase 2 is **optional** and designed to be conservative:
 
 Enable with:
 ```bat
-python patcher.py --vanilla "C:\vanilla" --out "C:\output" --phase2drops
+python patcher.py --vanilla "C:\vanilla" --out "C:\output" --enable-expansion-drops-in-classic
 ```
 
 ### Standard
@@ -113,11 +104,6 @@ python patcher.py --vanilla "C:\vanilla" --out "C:\output" --phase2drops
 python patcher.py --vanilla "C:\vanilla" --out "C:\output"
 ```
 
-### With Cow Test
-```bat
-set COWTEST=1
-python patcher.py --vanilla "C:\vanilla" --out "C:\output" --cowtest
-```
 
 ---
 
@@ -185,12 +171,21 @@ python patcher.py --vanilla "C:\vanilla" --out "C:\output" --cowtest
 
 ---
 
-## PatchR80 — patch.bat UI toggle parity
+## PatchR80 — patch.bat toggle parity
 
 **Date:** 2026-02-17
 
 ### What changed
-- Updated `patch.bat` to provide CowTest + UI toggle parity using environment switches:
-  - `set COWTEST=1` enables Cow Level test drop injection (`--cowtest`)
-  - `set UITEST=1` enables UI layout overrides (`--enable-ui`)
-- Default (`0/0`) behavior remains unchanged.
+- Updated `patch.bat` to provide gameplay/UI toggles via environment switches:
+  - `set ENABLE_EXPANSION_DROPS_IN_CLASSIC=1` enables Phase 2 safe drop integration
+  - `set COWALLBASES=1` enables the Cow Level base sampler (`--cow-all-bases`)
+  - `set COWCHAOS=1` enables full chaos mode (`--cow-all-bases-full`)
+  - `set UITOGGLE=1` enables UI layout overrides (`--enable-ui`)
+- Default behavior remains unchanged.
+
+## Cow base sampler (optional)
+
+Flags:
+- `--cow-all-bases` : Cow Level only. Adds difficulty-scaled Treasure Classes so cows can drop a wide spread of base items on Normal/Nightmare/Hell.
+- `--cow-all-bases-full` : Full chaos mode. All base tiers equally likely regardless of difficulty. Implies `--cow-all-bases`.
+
