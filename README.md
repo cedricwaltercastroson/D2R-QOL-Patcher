@@ -19,7 +19,7 @@ Built and validated against **Diablo II: Resurrected — Classic Offline** (v1.6
 - Jewelry consistency (Classic rule): rings/amulets forged from **magic** inputs only (no “normal” jewelry in Classic).
 
 ### Perfect Rolls / Maxroll Normalization
-- Uniques: forced to **perfect rolls** (min → max) via post-pass normalization.
+- Uniques: forced to **perfect rolls** (min → max) via post-pass normalization (runs *after* LoD→Classic ports so newly-enabled uniques are included).
 - Sets: forced to **perfect rolls** (min/amin → max/amax) via post-pass normalization.
 - Magic affixes:
   - `magicprefix.txt` maxroll enforcement
@@ -27,17 +27,21 @@ Built and validated against **Diablo II: Resurrected — Classic Offline** (v1.6
 - `automagic.txt` normalization where applicable.
 
 ### Classic Ports / Canonical Bases
-- **Shako base enabled** for Classic (code `uap`).
-- **Sacred Armor base enabled** for Classic (code `uar`).
-- **Harlequin Crest** remapped deterministically onto Shako base (Classic-safe mapping).
-- **Tyrael’s Might** mapped to Classic-compatible Sacred Armor (uar) and made forgeable.
 
-### Atlantean (Ancient Sword) — Correctness Fix (PatchR73)
-- Atlantean base: Ancient Sword (code `9wd`).
-- Restores **+2 Paladin Skills** by using correct property token: `pal` (NOT `paladin`).
-- Enforces **perfect Enhanced Damage** in the Atlantean template to prevent non-perfect rolls.
-- Keeps naming/color stability via the Classic engine key handling (Classic “Atlantian” key behavior).
+**Phase 1 (forge-only):** This patcher ports **all non-Assassin/Druid uniques** into Classic by:
+- Enabling the unique row (`version=0`, `enabled=1`) **in place** (no clones, no row reordering).
+- Enabling the corresponding **canonical base white item** for Classic in `armor.txt` / `weapons.txt` / `misc.txt` (`version=0`, `spawnable=1` where present).
+- Skipping Assassin/Druid class-locked bases/uniques (Classic original characters only).
 
+**Why in-place?** Keeping `uniqueitems.txt` structurally identical to vanilla prevents the “jumbled uniques” corruption mode.
+
+Notes:
+- The game engine enforces the vanilla **one-copy-per-unique-per-game-session** rule (forge obeys this).
+- Existing saves created under older remap schemes may show “invalid item” if the stored base differs; newly forged items are correct.
+
+### Atlantean (Ancient Sword)
+- The Atlantean is enabled for Classic **in place** on its original base: Ancient Sword (`9wd`).
+- No string injection is performed; the build relies on vanilla string keys.
 ### Level Requirement Adjustments
 - Removes/normalizes level requirements where required for testing (including Tyrael’s Might).
 - Sacred Armor base requirement is forced to a low, Classic-safe value for practical testing.
@@ -92,6 +96,17 @@ Disable:
 ---
 
 ## How To Run
+
+
+### Phase 2 Drops (SAFE integration)
+Phase 2 is **optional** and designed to be conservative:
+- Integrates ported (non-Assassin/Druid) **base items** into natural `treasureclassex.txt` drops.
+- **SAFE MODE:** fills **empty ItemN slots only** on high-level TCs (level >= 70); does not modify NoDrop/Picks or replace existing drops.
+
+Enable with:
+```bat
+python patcher.py --vanilla "C:\vanilla" --out "C:\output" --phase2drops
+```
 
 ### Standard
 ```bat

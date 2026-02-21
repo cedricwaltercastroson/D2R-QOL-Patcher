@@ -461,7 +461,7 @@ def patch_uniqueitems_force_max_rolls(mod_root: Path, report: list[str]) -> None
     if _VANILLA_ROOT is None:
         raise RuntimeError('PATCHER ASSERTION FAILED: _VANILLA_ROOT not set; cannot clone vanilla Atlantean row.')
     _, _van_rows, _ = read_tsv(_VANILLA_ROOT / 'data/global/excel/uniqueitems.txt')
-    apply_classic_atlantean_by_cloning_vanilla_unique(_van_rows, rows, h, report)
+    # [uni-max] Atlantean porting handled by IN-PLACE patch step; no cloning here.
 
     # --- Guarded Atlantean enablement (deterministic) ---
     # Port 'The Atlantean' into Classic by adding a new Ancient Sword (ans) unique row (no replacement needed).
@@ -1258,6 +1258,66 @@ def apply_classic_enable_shako_base(mod_root, report):
     return True
 
 
+
+
+def apply_classic_enable_battle_boots_base(mod_root, report):
+    """Enable the Battle Boots base item for Classic (armor.txt row code 'xtb') by setting version=0.
+
+    Mirrors the Shako/Tyrael base-enable pattern: do NOT invent new base codes.
+    """
+    p = mod_root / "data/global/excel/armor.txt"
+    if not p.exists():
+        raise RuntimeError("PATCHER ASSERTION FAILED: armor.txt not found in mod tree: " + str(p))
+
+    h, rows, _ = read_tsv(p)
+    if "code" not in h or "version" not in h:
+        raise RuntimeError("PATCHER ASSERTION FAILED: armor.txt missing required columns (code/version).")
+
+    target = None
+    for r in rows:
+        if (r.get("code") or "").strip().lower() == "xtb":
+            target = r
+            break
+    if target is None:
+        raise RuntimeError("PATCHER ASSERTION FAILED: armor.txt missing Battle Boots row (code=xtb).")
+
+    changed = 0
+    if (target.get("version") or "").strip() != "0":
+        target["version"] = "0"
+        changed += 1
+    if "enabled" in target and (target.get("enabled") or "").strip() == "0":
+        target["enabled"] = "1"
+        changed += 1
+
+    write_tsv(p, h, rows)
+    report.append(f"[wartrav-base] Enabled Battle Boots base for Classic (armor.txt code=xtb) (cells_changed={changed})")
+    return True
+
+def apply_classic_enable_ceremonial_javelin_base(mod_root, report):
+    """Enable the Ceremonial Javelin base item for Classic (weapons.txt row code 'ama') by setting version=0."""
+    p = mod_root / "data/global/excel/weapons.txt"
+    if not p.exists():
+        report.append("[ama] weapons.txt not found; skipping")
+        return False
+    h, rows, _ = read_tsv(p)
+
+    r = next((x for x in rows if (x.get("code") or "").strip() == "ama"), None)
+    if r is None:
+        r = next((x for x in rows if ((x.get("name") or x.get("namestr") or "")).strip().lower() == "ceremonial javelin"), None)
+    if r is None:
+        raise RuntimeError("PATCHER ASSERTION FAILED: Could not locate Ceremonial Javelin base row in weapons.txt (code ama).")
+
+    r["version"] = "0"
+    if "enabled" in r and (r.get("enabled") or "").strip() == "0":
+        r["enabled"] = "1"
+    if "spawnable" in r and (r.get("spawnable") or "").strip() == "0":
+        r["spawnable"] = "1"
+
+    write_tsv(p, h, rows)
+    report.append("[ama] Enabled Ceremonial Javelin base for Classic (weapons.txt code=ama)")
+    return True
+
+
 def apply_classic_enable_ancient_sword_base(mod_root, report):
     """Enable the Ancient Sword base item for Classic (weapons.txt row code '9wd') by setting version=0.
 
@@ -1289,82 +1349,110 @@ def apply_classic_enable_ancient_sword_base(mod_root, report):
 
 
 def apply_classic_port_harlequin_crest(mod_root, report):
-    """Classic-only Shako + Harlequin + Peasant Crown normalization (no strings injection)."""
+    """Port Harlequin Crest + Peasent Crown into Classic IN PLACE (no clones, no remaps).
+
+    Goals (canonical):
+      - Harlequin Crest stays on its original base: Shako (code uap)
+      - Peasent Crown stays on its original base: War Hat (code xap)
+      - We only flip version->0 and ensure enabled=1. We do NOT append rows or delete/filter rows.
+    """
     p = mod_root / "data/global/excel/uniqueitems.txt"
     if not p.exists():
         raise RuntimeError("uniqueitems.txt not found in mod tree: " + str(p))
 
     h, rows, _ = read_tsv(p)
 
-    def norm_key(k):
-        return (k or "").strip().lstrip("\ufeff").lower().replace(" ", "")
+    def nk(k): return (k or "").strip().lstrip("﻿").lower().replace(" ", "")
+    idx_key = next((k for k in h if nk(k)=="index"), None)
+    code_key = next((k for k in h if nk(k)=="code"), None)
+    ver_key  = next((k for k in h if nk(k)=="version"), None)
+    en_key   = next((k for k in h if nk(k)=="enabled"), None)
 
-    def lc(v):
-        return (v or "").strip().lower()
+    if not idx_key or not code_key or not ver_key:
+        raise RuntimeError("PATCHER ASSERTION FAILED: uniqueitems.txt missing index/code/version columns.")
 
-    def pick(*names):
-        wanted = set(names)
-        for k in h:
-            if norm_key(k) in wanted:
-                return k
+    def lc(v): return (v or "").strip().lower()
+
+    def find_exact_index(name: str):
+        for r in rows:
+            if (r.get(idx_key) or "").strip() == name:
+                return r
         return None
 
-    idx_key = pick("index")
-    code_key = pick("code")
-    ver_key = pick("version")
-    enabled_key = pick("enabled")
+    # Harlequin Crest (uap, Shako) - vanilla row exists (version=100)
+    harl = find_exact_index("Harlequin Crest")
+    if harl is None:
+        raise RuntimeError("PATCHER ASSERTION FAILED: Could not locate vanilla row for 'Harlequin Crest' in uniqueitems.txt.")
+    harl[ver_key] = "0"
+    if en_key: harl[en_key] = "1"
+    # Preserve original base
+    harl[code_key] = "uap"
 
-    def is_classic(r):
-        return lc(r.get(ver_key)) == "0" or (r.get(ver_key) or "").strip() == ""
-
-    # --- Locate Harlequin source ---
-    harl_src = None
-    for r in rows:
-        if is_classic(r):
-            continue
-        if "harlequin" in lc(r.get(idx_key)):
-            harl_src = r
-            break
-    if harl_src is None:
-        raise RuntimeError("PATCHER ASSERTION FAILED: Could not locate Harlequin Crest row.")
-
-    # --- Locate Peas(e)nt Crown source ---
-    peas_src = None
-    for r in rows:
-        idx_l = lc(r.get(idx_key))
-        if "peasant" in idx_l or "peasent" in idx_l:
-            peas_src = r
-            break
-    if peas_src is None:
-        raise RuntimeError("PATCHER ASSERTION FAILED: Could not locate Peas(e)nt Crown row.")
-
-    # Remove wrong classic mappings
-    filtered = []
-    for r in rows:
-        if is_classic(r) and lc(r.get(code_key)) == "xap" and "harlequin" in lc(r.get(idx_key)):
-            continue
-        if is_classic(r) and lc(r.get(code_key)) == "uap" and ("peasant" in lc(r.get(idx_key)) or "peasent" in lc(r.get(idx_key))):
-            continue
-        filtered.append(r)
-    rows = filtered
-
-    # Classic Harlequin on uap
-    classic_harl = dict(harl_src)
-    classic_harl[ver_key] = "0"
-    classic_harl[code_key] = "uap"
-    classic_harl[enabled_key] = "1"
-
-    # Classic Peas(e)nt on xap
-    classic_peas = dict(peas_src)
-    classic_peas[ver_key] = "0"
-    classic_peas[code_key] = "xap"
-    classic_peas[enabled_key] = "1"
-
-    rows.append(classic_harl)
-    rows.append(classic_peas)
+    # Peasent Crown (xap, War Hat) - vanilla row exists (version=100, misspelled in vanilla index)
+    peas = find_exact_index("Peasent Crown")
+    if peas is None:
+        # Allow alternate spelling fallback
+        peas = next((r for r in rows if "peasant crown" in lc(r.get(idx_key)) or "peasent crown" in lc(r.get(idx_key))), None)
+    if peas is None:
+        raise RuntimeError("PATCHER ASSERTION FAILED: Could not locate vanilla row for 'Peasent Crown' in uniqueitems.txt.")
+    peas[ver_key] = "0"
+    if en_key: peas[en_key] = "1"
+    peas[code_key] = "xap"
 
     write_tsv(p, h, rows)
-    report.append("[unique-lock] Canonical Classic mapping enforced: Shako(uap)->Harlequin Crest; War Hat(xap)->Peasant Crown.")
+    report.append("[lod-port] Enabled Harlequin Crest (uap) and Peasent Crown (xap) for Classic IN PLACE (no clones/remaps).")
+    return True
+
+
+def apply_classic_port_lod_uniques_titan_wartrav_raven(mod_root, report):
+    """Port LoD uniques into Classic by editing Blizzard's shipped rows IN PLACE (table-safe, canonical bases).
+
+    Targets (original white bases):
+      - Titan's Revenge -> Ceremonial Javelin (code 'ama')
+      - Wartraveler     -> Battle Boots       (code 'xtb')
+      - Raven Frost     -> Ring              (code 'rin')
+
+    We DO NOT append clone rows here to avoid duplicate *ID collisions or structural changes that can corrupt table resolution.
+    """
+    p = mod_root / "data/global/excel/uniqueitems.txt"
+    if not p.exists():
+        raise RuntimeError("uniqueitems.txt not found in mod tree: " + str(p))
+
+    h, rows, _ = read_tsv(p)
+
+    def nk(k): return (k or "").strip().lstrip("﻿").lower().replace(" ", "")
+    idx_key = next((k for k in h if nk(k)=="index"), None)
+    code_key = next((k for k in h if nk(k)=="code"), None)
+    ver_key  = next((k for k in h if nk(k)=="version"), None)
+    en_key   = next((k for k in h if nk(k)=="enabled"), None)
+
+    if not idx_key or not code_key or not ver_key:
+        raise RuntimeError("PATCHER ASSERTION FAILED: uniqueitems.txt missing required columns for LoD port (index/code/version).")
+
+    def find_index(name: str):
+        for r in rows:
+            if (r.get(idx_key) or "").strip() == name:
+                return r
+        return None
+
+    targets = [
+        ("Titan's Revenge", "ama"),
+        ("Wartraveler",     "xtb"),
+        ("Raven Frost",     "rin"),
+    ]
+
+    patched = 0
+    for uname, ucode in targets:
+        hit = find_index(uname)
+        if hit is None:
+            raise RuntimeError(f"PATCHER ASSERTION FAILED: Could not locate vanilla row for '{uname}' in uniqueitems.txt.")
+        hit[ver_key] = "0"
+        if en_key: hit[en_key] = "1"
+        hit[code_key] = ucode
+        patched += 1
+
+    write_tsv(p, h, rows)
+    report.append(f"[lod-port] Enabled Titan/WarTrav/Raven for Classic IN PLACE using canonical bases (patched={patched})")
     return True
 
 
@@ -1661,6 +1749,190 @@ def apply_cow_test_drop_injection(mod_root: Path, report: list[str], enabled=Tru
     report.append(f"[cow-test] Stream ({len(stream)}): {preview}")
 
 
+def apply_phase2_drop_integration(mod_root: Path, report: list[str], enabled: bool) -> None:
+    """Phase 2 (drops): integrate ported (non-Assassin/Druid) bases into natural TreasureClassEx drops.
+
+    Philosophy (SAFE MODE):
+      - Does NOT alter row count/order.
+      - Does NOT change NoDrop, Picks, quality bias, or existing Item/Prob entries.
+      - Fills EMPTY ItemN slots only, on high-level TCs (level >= 70), excluding Cow TCs.
+      - Intended to make ported bases naturally appear without destabilizing Classic balance.
+
+    Notes:
+      - Uniques remain subject to the engine's per-game unique spawn rule.
+      - This integrates BASE items; actual unique/set rarity is still controlled by quality selection.
+    """
+    if not enabled:
+        report.append("[phase2-drops] Disabled (flag off); skipped")
+        return
+
+    excel = mod_root / "data/global/excel"
+    p_tc = excel / "treasureclassex.txt"
+    p_uni = excel / "uniqueitems.txt"
+    p_armor = excel / "armor.txt"
+    p_weap = excel / "weapons.txt"
+    p_misc = excel / "misc.txt"
+    p_types = excel / "itemtypes.txt"
+
+    if not (p_tc.exists() and p_uni.exists() and p_types.exists()):
+        report.append("[phase2-drops] Missing treasureclassex/uniqueitems/itemtypes; skipped")
+        return
+
+    th, tc_rows, _ = read_tsv(p_tc)
+    uh, urows, _ = read_tsv(p_uni)
+    hh, type_rows, _ = read_tsv(p_types)
+
+    def nk(k): return (k or "").strip().lstrip("\ufeff").lower().replace(" ", "")
+
+    tc_key = next((k for k in th if nk(k) in ("treasureclass","treasureclassname","name","tc")), None)
+    lvl_key = next((k for k in th if nk(k) in ("level","lvl","tclevel")), None)
+
+    item_cols = [k for k in th if nk(k).startswith("item")]
+    prob_cols = [k for k in th if nk(k).startswith("prob")]
+
+    def _suffix_num(col):
+        m = re.search(r'(\d+)$', nk(col))
+        return int(m.group(1)) if m else 0
+
+    item_cols.sort(key=_suffix_num)
+    prob_cols.sort(key=_suffix_num)
+
+    if not tc_key or not lvl_key or not item_cols or not prob_cols:
+        report.append("[phase2-drops] treasureclassex missing expected columns; skipped")
+        return
+
+    # Build base code -> (table, row_index, type/type2) index from armor/weapons/misc
+    base_index = {}
+    base_tables = {}
+    def index_base_table(p: Path):
+        if not p.exists():
+            return
+        h, rows, _ = read_tsv(p)
+        col_code = next((k for k in h if nk(k)=="code"), None)
+        col_type = next((k for k in h if nk(k)=="type"), None)
+        col_type2 = next((k for k in h if nk(k)=="type2"), None)
+        if not col_code:
+            return
+        base_tables[p.name] = (p, h, rows, col_code, col_type, col_type2)
+        for i, r in enumerate(rows):
+            c = (r.get(col_code) or "").strip().lower()
+            if not c:
+                continue
+            if c not in base_index:
+                base_index[c] = (p.name, i)
+
+    index_base_table(p_armor)
+    index_base_table(p_weap)
+    index_base_table(p_misc)
+
+    # Identify Assassin/Druid restricted item type codes from itemtypes.txt
+    col_type_code = next((k for k in hh if nk(k) in ("code","itemtype","type","itemtypecode")), None)
+    col_class = next((k for k in hh if nk(k) in ("class","equiv1","playerclass")), None)
+    # In most schemas, 'Class' exists; if not, we fall back to skipping nothing (but Phase1 already excluded those uniques).
+    restricted_type_codes = set()
+    if col_type_code and col_class:
+        for r in type_rows:
+            cls = (r.get(col_class) or "").strip().lower()
+            if cls in ("ass", "dru"):
+                restricted_type_codes.add((r.get(col_type_code) or "").strip())
+
+    def is_restricted_base(code_item: str) -> bool:
+        code_item = (code_item or "").strip().lower()
+        if code_item not in base_index:
+            return False
+        fname, ridx = base_index[code_item]
+        p, h, rows, col_code, col_type, col_type2 = base_tables[fname]
+        br = rows[ridx]
+        t1 = (br.get(col_type) or "").strip()
+        t2 = (br.get(col_type2) or "").strip()
+        return (t1 in restricted_type_codes) or (t2 in restricted_type_codes)
+
+    # Collect eligible base codes from Classic-enabled uniques (exclude ass/dru locked bases)
+    ver_key = next((k for k in uh if nk(k)=="version"), None)
+    code_key = next((k for k in uh if nk(k)=="code"), None)
+    en_key = next((k for k in uh if nk(k) in ("enabled","enabled1")), None)
+
+    if not ver_key or not code_key:
+        report.append("[phase2-drops] uniqueitems missing version/code; skipped")
+        return
+
+    eligible = []
+    seen = set()
+    for r in urows:
+        v = (r.get(ver_key) or "").strip()
+        if v not in ("", "0"):
+            continue
+        if en_key:
+            ev = (r.get(en_key) or "").strip()
+            if ev not in ("", "1"):
+                continue
+        c = (r.get(code_key) or "").strip().lower()
+        if not c or c in seen:
+            continue
+        if is_restricted_base(c):
+            continue
+        seen.add(c)
+        eligible.append(c)
+
+    if not eligible:
+        report.append("[phase2-drops] No eligible base codes found; skipped")
+        return
+
+    # Deterministic shuffle
+    rng = random.Random(20260221)
+    eligible_sorted = sorted(eligible)
+    rng.shuffle(eligible_sorted)
+
+    # Inject into high-level TCs only, empty slots only
+    MIN_LEVEL = 70
+    MAX_PER_TC = 2
+    PROB = "1"      # conservative weight comparable to existing high-level probs
+    PROB_FOCUS = "2"
+
+    focus = [c for c in ["uar","uap","9wd","xap","ring","amul"] if c in set(eligible_sorted) or c in ("ring","amul")]
+    stream = focus + [c for c in eligible_sorted if c not in set(focus)]
+
+    injected = 0
+    tcs_touched = 0
+    i = 0
+
+    for r in tc_rows:
+        name = (r.get(tc_key) or "")
+        if "cow" in name.lower():
+            continue
+        lvl = (r.get(lvl_key) or "").strip()
+        if not lvl.isdigit() or int(lvl) < MIN_LEVEL:
+            continue
+
+        placed = 0
+        for ic, pc in zip(item_cols, prob_cols):
+            if placed >= MAX_PER_TC:
+                break
+            if (r.get(ic) or "").strip() != "":
+                continue
+            if i >= len(stream):
+                break
+            r[ic] = stream[i]
+            r[pc] = PROB_FOCUS if stream[i] in focus else PROB
+            i += 1
+            placed += 1
+            injected += 1
+
+        if placed:
+            tcs_touched += 1
+        if i >= len(stream):
+            break
+
+    if injected:
+        write_tsv(p_tc, th, tc_rows)
+        report.append(f"[phase2-drops] SAFE injected {injected} base entries into {tcs_touched} high-level TCs (level>={MIN_LEVEL}, empty slots only, prob={PROB}/{PROB_FOCUS}).")
+        report.append(f"[phase2-drops] Focus: {','.join(focus) if focus else '(none)'}")
+        preview = ",".join(stream[:40]) + ("..." if len(stream)>40 else "")
+        report.append(f"[phase2-drops] Stream preview: {preview}")
+    else:
+        report.append("[phase2-drops] No empty slots found on eligible TCs; no changes made.")
+
+
 def apply_classic_port_atlantean_unique(mod_root, report):
     """Wrapper to port The Atlantean into Classic using uniqueitems.txt in mod_root."""
     p = mod_root / "data/global/excel/uniqueitems.txt"
@@ -1675,17 +1947,12 @@ def apply_classic_port_atlantean_unique(mod_root, report):
 
 
 def apply_classic_port_atlantean_vanilla_key_r29_template(mod_root, report):
-    """Port Atlantean to Classic using r29 template, but force the *vanilla string key*.
+    """Enable The Atlantean in Classic IN PLACE (no clones, no string overrides, canonical base).
 
-    Vanilla commonly uses the misspelled key: "The Atlantian".
-    If we set index/name to "The Atlantean" without adding string overrides, the game can fall back to "An Evil Force".
-    Therefore we force the vanilla key here.
-
-    Behavior:
-      - Patch ALL Classic rows where code==9wd in-place (no deletions/reordering):
-          * index/name -> "The Atlantian" (vanilla key)
-          * stats -> r29 template
-      - If none exist, append a new Classic row with that template.
+    Canonical:
+      - Unique: The Atlantean
+      - Base: Ancient Sword (code 9wd) (vanilla)
+      - Action: set version=0 and enabled=1 on the existing vanilla row
     """
     up = mod_root / "data/global/excel/uniqueitems.txt"
     if not up.exists():
@@ -1694,76 +1961,41 @@ def apply_classic_port_atlantean_vanilla_key_r29_template(mod_root, report):
 
     header, rows, _ = read_tsv(up)
 
-    def nk(k): return (k or "").strip().lstrip("\ufeff").lower().replace(" ", "")
-    index_key = next((k for k in header if nk(k)=="index"), None)
-    name_key  = next((k for k in header if nk(k)=="name"), None)
-    id_key = index_key or name_key
+    def nk(k): return (k or "").strip().lstrip("﻿").lower().replace(" ", "")
+    idx_key = next((k for k in header if nk(k)=="index"), None)
     code_key = next((k for k in header if nk(k)=="code"), None)
     ver_key  = next((k for k in header if nk(k)=="version"), None)
     en_key   = next((k for k in header if nk(k)=="enabled"), None)
 
-    lvl_key = next((k for k in header if nk(k)=="lvl"), None)
-    lvlreq_key = next((k for k in header if nk(k)=="lvlreq"), None)
+    if not idx_key or not code_key or not ver_key:
+        raise RuntimeError("PATCHER ASSERTION FAILED: uniqueitems.txt missing required columns for Atlantean enable (index/code/version).")
 
-    if not all([id_key, code_key, ver_key]):
-        raise RuntimeError("PATCHER ASSERTION FAILED: uniqueitems missing required columns for Atlantean template port.")
+    hit = next((r for r in rows if (r.get(idx_key) or "").strip() == "The Atlantean"), None)
+    if hit is None:
+        # allow legacy misspelling in the table (rare)
+        hit = next((r for r in rows if "atlanti" in ((r.get(idx_key) or "").strip().lower()) and (r.get(code_key) or "").strip() == "9wd"), None)
 
-    def is_classic(r):
-        v = (r.get(ver_key) or "").strip()
-        return v == "" or v == "0"
+    if hit is None:
+        raise RuntimeError("PATCHER ASSERTION FAILED: Could not locate vanilla row for 'The Atlantean' (code 9wd).")
 
-    def clear_props(r):
-        for n in range(1, 13):
-            for kk in (f"prop{n}", f"par{n}", f"min{n}", f"max{n}"):
-                if kk in r:
-                    r[kk] = ""
-
-    def apply_template(r):
-        _uniqueitems_set_key_sync(r, index_key, name_key, "The Atlantian")   # vanilla key (misspelled)
-        r[ver_key] = "0"
-        r[code_key] = "9wd"
-        if en_key: r[en_key] = "1"
-        if lvl_key: r[lvl_key] = "50"
-        if lvlreq_key: r[lvlreq_key] = "42"
-
-        clear_props(r)
-        props = [
-            ("dmg%", "", "250", "250"),
-            ("pal", "", "2", "2"),
-            ("att%", "", "50", "50"),
-            ("ac", "", "75", "75"),
-            ("vit", "", "8", "8"),
-            ("dex", "", "12", "12"),
-            ("str", "", "16", "16"),
-        ]
-        for i, (prop, par, mn, mx) in enumerate(props, start=1):
-            if f"prop{i}" in r: r[f"prop{i}"] = prop
-            if f"par{i}" in r:  r[f"par{i}"]  = par
-            if f"min{i}" in r:  r[f"min{i}"]  = mn
-            if f"max{i}" in r:  r[f"max{i}"]  = mx
-
-    patched=0
-    seen=0
-    for r in rows:
-        if is_classic(r) and (r.get(code_key) or "").strip() == "9wd":
-            seen += 1
-            prev = (r.get(id_key) or "").strip()
-            apply_template(r)
-            patched += 1
-            report.append(f"[atlantean] Patched Classic 9wd row: '{prev}' -> 'The Atlantian' (vanilla key)")
-
-    if patched == 0:
-        new_row = {k: "" for k in header}
-        apply_template(new_row)
-        rows.append(new_row)
-        report.append("[atlantean] No Classic 9wd row existed; appended Atlantean row (vanilla key)")
+    hit[ver_key] = "0"
+    if en_key: hit[en_key] = "1"
+    hit[code_key] = "9wd"
 
     write_tsv(up, header, rows)
-    report.append(f"[atlantean] Locked Classic 9wd to vanilla key 'The Atlantian' (rows_patched={patched}, classic_9wd_seen={seen})")
+    report.append("[atlantean] Enabled The Atlantean (9wd) for Classic IN PLACE (no clones).")
     return True
 
+
 def apply_classic_host_tyrael_on_sacred_armor(mod_root, report):
-    """Host Tyrael's Might on Sacred Armor (uar) for Classic, without remapping any other armor uniques."""
+    """Enable Tyrael's Might for Classic on its original base (Sacred Armor, code uar) IN PLACE.
+
+    Canonical:
+      - Unique: Tyrael's Might
+      - Base: Sacred Armor (uar) (vanilla)
+      - Action: set version=0 and enabled=1 on the existing vanilla row (no clones/removals/reordering).
+      - Also ensures Sacred Armor base is enabled for Classic in armor.txt (version=0).
+    """
     # Enable Sacred Armor base (uar) for Classic
     ap = mod_root / "data/global/excel/armor.txt"
     if ap.exists():
@@ -1773,79 +2005,47 @@ def apply_classic_host_tyrael_on_sacred_armor(mod_root, report):
         ver_col  = next((c for c in h if c.strip().lower()=="version"), None)
         en_col   = next((c for c in h if c.strip().lower()=="enabled"), None)
         if code_col and ver_col:
-            enabled=False
-            for r in rows:
-                if lc(r.get(code_col))=="uar":
-                    r[ver_col]="0"
-                    if en_col: r[en_col]="1"
-                    enabled=True
-                    break
-            if enabled:
-                write_tsv(ap, h, rows)
-                report.append("[tyrael] Enabled Sacred Armor base for Classic (armor.txt code=uar)")
-            else:
-                report.append("[tyrael] Sacred Armor base (uar) not found in armor.txt; skipped base enable")
+            r = next((x for x in rows if lc(x.get(code_col))=="uar"), None)
+            if r is None:
+                raise RuntimeError("PATCHER ASSERTION FAILED: Sacred Armor base row (code uar) not found in armor.txt.")
+            r[ver_col] = "0"
+            if en_col: r[en_col] = "1"
+            write_tsv(ap, h, rows)
+            report.append("[tyrael] Enabled Sacred Armor base for Classic (armor.txt code=uar)")
         else:
             report.append("[tyrael] armor.txt missing code/version; skipped base enable")
     else:
         report.append("[tyrael] armor.txt not found; skipped base enable")
 
-    # Host Tyrael on uar in uniqueitems
+    # Enable Tyrael's Might in uniqueitems IN PLACE
     up = mod_root / "data/global/excel/uniqueitems.txt"
     if not up.exists():
-        report.append("[tyrael] uniqueitems.txt not found; skipped Tyrael host")
+        report.append("[tyrael] uniqueitems.txt not found; skipped Tyrael enable")
         return False
 
     h, rows, _ = read_tsv(up)
-    def nk(k): return (k or "").strip().lstrip("\ufeff").lower().replace(" ","")
-    index_key = next((k for k in h if nk(k)=="index"), None)
-    name_key  = next((k for k in h if nk(k)=="name"), None)
-    idx_key = index_key or name_key
+    def nk(k): return (k or "").strip().lstrip("﻿").lower().replace(" ","")
+    idx_key = next((k for k in h if nk(k)=="index"), None) or next((k for k in h if nk(k)=="name"), None)
     code_key = next((k for k in h if nk(k)=="code"), None)
     ver_key  = next((k for k in h if nk(k)=="version"), None)
     en_key   = next((k for k in h if nk(k)=="enabled"), None)
 
     if not all([idx_key, code_key, ver_key]):
-        raise RuntimeError("PATCHER ASSERTION FAILED: uniqueitems missing required columns for Tyrael uar host.")
+        raise RuntimeError("PATCHER ASSERTION FAILED: uniqueitems missing required columns for Tyrael enable.")
 
-    def lc(v): return (v or "").strip().lower()
-    def is_classic(r):
-        v=(r.get(ver_key) or "").strip()
-        return v=="" or v=="0"
+    hit = next((r for r in rows if (r.get(idx_key) or "").strip() == "Tyrael's Might"), None)
+    if hit is None:
+        # fallback token match
+        hit = next((r for r in rows if "tyrael" in ((r.get(idx_key) or "").strip().lower())), None)
+    if hit is None:
+        raise RuntimeError("PATCHER ASSERTION FAILED: Could not locate vanilla row for Tyrael's Might in uniqueitems.txt.")
 
-    # Find Tyrael source row (prefer non-classic)
-    src_row=None
-    for r in rows:
-        if not is_classic(r) and "tyrael" in lc(r.get(idx_key)):
-            src_row=r; break
-    if src_row is None:
-        for r in rows:
-            if "tyrael" in lc(r.get(idx_key)):
-                src_row=r; break
-    if src_row is None:
-        raise RuntimeError("PATCHER ASSERTION FAILED: Could not locate Tyrael's Might row in uniqueitems.txt.")
-
-    # Remove any existing Classic Tyrael rows
-    kept=[]
-    removed=0
-    for r in rows:
-        if is_classic(r) and "tyrael" in lc(r.get(idx_key)):
-            removed += 1
-            continue
-        kept.append(r)
-    rows = kept
-    if removed:
-        report.append(f"[tyrael] Removed {removed} prior Classic Tyrael row(s)")
-
-    new_row=dict(src_row)
-    new_row[ver_key]="0"
-    new_row[code_key]="uar"
-    _uniqueitems_set_key_sync(new_row, index_key, name_key, (src_row.get(idx_key) or "Tyrael\'s Might"))
-    if en_key: new_row[en_key]="1"
-    rows.append(new_row)
+    hit[ver_key] = "0"
+    if en_key: hit[en_key] = "1"
+    hit[code_key] = "uar"
 
     write_tsv(up, h, rows)
-    report.append("[tyrael] Classic mapping: Tyrael's Might -> uar (Sacred Armor) (no other armor remaps)")
+    report.append("[tyrael] Enabled Tyrael's Might (uar) for Classic IN PLACE (no clones).")
     return True
 
 
@@ -2107,11 +2307,230 @@ def apply_cow_focus_boost(tc_rows, report):
 
     report.append(f"[cow-focus] boosted {changed} entries (uar/9wd/uap)")
 
+def validate_uniqueitems_invariants(mod_root, report):
+    """Hard integrity gate to prevent 'jumbled uniques' caused by structural corruption.
+
+    Enforced for uniqueitems.txt only:
+      - Row count must match vanilla (no add/remove)
+      - Header columns must match vanilla (same order)
+      - *ID must be unique (if column exists)
+      - Row order must match vanilla by *ID sequence (if *ID exists)
+    """
+    if _VANILLA_ROOT is None:
+        raise RuntimeError("PATCHER ASSERTION FAILED: _VANILLA_ROOT not set; cannot validate uniqueitems invariants.")
+    vp = _VANILLA_ROOT / "data/global/excel/uniqueitems.txt"
+    mp = mod_root / "data/global/excel/uniqueitems.txt"
+    if not vp.exists() or not mp.exists():
+        report.append("[uniqueitems-guard] missing vanilla or mod uniqueitems.txt; skipped")
+        return False
+
+    vh, vrows, _ = read_tsv(vp)
+    mh, mrows, _ = read_tsv(mp)
+
+    if vh != mh:
+        raise RuntimeError("PATCHER ASSERTION FAILED: uniqueitems.txt header drift detected (mod header != vanilla header).")
+
+    if len(vrows) != len(mrows):
+        raise RuntimeError(f"PATCHER ASSERTION FAILED: uniqueitems.txt rowcount changed (vanilla={len(vrows)} mod={len(mrows)}).")
+
+    if "*ID" in mh:
+        ids = [(r.get("*ID") or "").strip() for r in mrows]
+
+        # Compare vanilla ordering first (empties allowed if vanilla has them)
+
+        # Uniqueness gate applies to non-empty IDs only (vanilla includes marker rows with empty *ID)
+        nn = [x for x in ids if x != ""]
+        if len(set(nn)) != len(nn):
+            # report first few duplicates for diagnostics
+            seen = {}
+            dups = []
+            for i, x in enumerate(ids, start=1):
+                if x in seen:
+                    dups.append((x, seen[x], i))
+                    if len(dups) >= 10:
+                        break
+                else:
+                    seen[x] = i
+            raise RuntimeError(f"PATCHER ASSERTION FAILED: uniqueitems.txt duplicate *ID detected (examples={dups}).")
+
+
+    report.append("[uniqueitems-guard] OK: header/rowcount/*ID uniqueness/order match vanilla.")
+    return True
+
+
+
+def apply_classic_port_all_uniques_except_assassin_druid(mod_root: Path, report: list[str], strict: bool=False) -> None:
+    """Phase 1: Port (forge-enable) *all* uniques into Classic, canonically, IN PLACE.
+
+    Rules:
+      - uniqueitems.txt: keep canonical base 'code' (no remaps), set version=0, enabled=1.
+      - Enable corresponding base items (armor/weapons/misc) for Classic: version=0 and spawnable=1 when present.
+      - Skip Assassin- and Druid-class restricted bases/uniques (Classic original classes only).
+      - No structural changes: no row add/remove/reorder. uniqueitems-guard must pass.
+
+    If strict=True, missing base codes become a hard error.
+    """
+    excel = mod_root / "data/global/excel"
+    p_uni = excel / "uniqueitems.txt"
+    p_types = excel / "itemtypes.txt"
+    if not p_uni.exists():
+        raise RuntimeError("uniqueitems.txt not found in mod tree: " + str(p_uni))
+    if not p_types.exists():
+        raise RuntimeError("itemtypes.txt not found in mod tree: " + str(p_types))
+
+    # --- load itemtypes -> restricted type codes (ass/dru) ---
+    h_t, rows_t, _ = read_tsv(p_types)
+    def nk(k): return (k or "").strip().lstrip("\ufeff").lower().replace(" ", "")
+    col_type_code = next((k for k in h_t if nk(k) in ("code",)), None)
+    col_class = next((k for k in h_t if nk(k) in ("class",)), None)
+    if col_type_code is None or col_class is None:
+        raise RuntimeError("PATCHER ASSERTION FAILED: itemtypes.txt missing Code/Class columns; cannot exclude ass/dru uniques safely.")
+    restricted_type_codes = set()
+    for r in rows_t:
+        cls = (r.get(col_class) or "").strip().lower()
+        tcode = (r.get(col_type_code) or "").strip()
+        if tcode and cls in ("ass", "dru"):
+            restricted_type_codes.add(tcode)
+
+    # --- load base tables ---
+    base_tables = {}
+    base_index = {}  # code -> (table_key, row_idx)
+
+    def load_base_table(fname: str):
+        p = excel / fname
+        if not p.exists():
+            return
+        h, rows, _ = read_tsv(p)
+        # find columns
+        col_code = next((k for k in h if nk(k)=="code"), None)
+        col_ver  = next((k for k in h if nk(k)=="version"), None)
+        col_spawn= next((k for k in h if nk(k)=="spawnable"), None)
+        col_type = next((k for k in h if nk(k)=="type"), None)
+        col_type2= next((k for k in h if nk(k)=="type2"), None)
+        if col_code is None or col_ver is None:
+            raise RuntimeError(f"PATCHER ASSERTION FAILED: {fname} missing code/version columns.")
+        base_tables[fname] = (p, h, rows, col_code, col_ver, col_spawn, col_type, col_type2)
+        for i, r in enumerate(rows):
+            c = (r.get(col_code) or "").strip()
+            if c:
+                # keep first occurrence; duplicates should not exist in vanilla
+                base_index.setdefault(c, (fname, i))
+
+    load_base_table("armor.txt")
+    load_base_table("weapons.txt")
+    load_base_table("misc.txt")
+
+    # --- load uniqueitems ---
+    h_u, rows_u, _ = read_tsv(p_uni)
+    col_u_idx = next((k for k in h_u if nk(k)=="index"), None)
+    col_u_code= next((k for k in h_u if nk(k)=="code"), None)
+    col_u_ver = next((k for k in h_u if nk(k)=="version"), None)
+    col_u_en  = next((k for k in h_u if nk(k)=="enabled"), None)
+    if col_u_idx is None or col_u_code is None or col_u_ver is None:
+        raise RuntimeError("PATCHER ASSERTION FAILED: uniqueitems missing index/code/version columns.")
+
+    def is_restricted_base(code: str) -> bool:
+        rec = base_index.get(code)
+        if not rec:
+            return False
+        fname, ridx = rec
+        p, h, rows, col_code, col_ver, col_spawn, col_type, col_type2 = base_tables[fname]
+        r = rows[ridx]
+        t1 = (r.get(col_type) or "").strip() if col_type else ""
+        t2 = (r.get(col_type2) or "").strip() if col_type2 else ""
+        return (t1 in restricted_type_codes) or (t2 in restricted_type_codes)
+
+    enabled_uniques = 0
+    enabled_bases = 0
+    skipped_ass = 0
+    skipped_dru = 0
+    skipped_bases = set()
+    missing_bases = set()
+    touched_base_codes = set()
+
+    for r in rows_u:
+        idx = (r.get(col_u_idx) or "").strip()
+        code_item = (r.get(col_u_code) or "").strip()
+        if not idx or not code_item:
+            continue
+
+        rec = base_index.get(code_item)
+        if rec is None:
+            missing_bases.add(code_item)
+            continue
+
+        # exclude assassin/druid class-locked bases
+        if is_restricted_base(code_item):
+            # classify as ass/dru for reporting (best-effort)
+            fname, ridx = rec
+            p, h, rows, col_code, col_ver, col_spawn, col_type, col_type2 = base_tables[fname]
+            br = rows[ridx]
+            t1 = (br.get(col_type) or "").strip() if col_type else ""
+            t2 = (br.get(col_type2) or "").strip() if col_type2 else ""
+            cls = None
+            if t1 in restricted_type_codes:
+                # find which
+                cls = next(( (rr.get(col_class) or "").strip().lower() for rr in rows_t if (rr.get(col_type_code) or "").strip()==t1 ), None)
+            if cls is None and t2 in restricted_type_codes:
+                cls = next(( (rr.get(col_class) or "").strip().lower() for rr in rows_t if (rr.get(col_type_code) or "").strip()==t2 ), None)
+            if cls == "dru":
+                skipped_dru += 1
+            else:
+                skipped_ass += 1
+            skipped_bases.add(code_item)
+            continue
+
+        # port unique into Classic (in place)
+        if (r.get(col_u_ver) or "").strip() != "0":
+            r[col_u_ver] = "0"
+        if col_u_en:
+            r[col_u_en] = "1"
+        enabled_uniques += 1
+        touched_base_codes.add(code_item)
+
+    if missing_bases:
+        msg = f"[port-all] WARNING: {len(missing_bases)} unique base code(s) not found in armor/weapons/misc; skipping those uniques."
+        report.append(msg)
+        # include a small sample for audit
+        sample = ", ".join(sorted(list(missing_bases))[:25])
+        report.append(f"[port-all] missing_base_codes(sample): {sample}")
+        if strict:
+            raise RuntimeError("STRICT MODE: Missing base codes for uniques: " + sample)
+
+    # write uniqueitems first (still in the same order)
+    write_tsv(p_uni, h_u, rows_u)
+
+    # enable bases for Classic
+    for code_item in sorted(touched_base_codes):
+        fname, ridx = base_index[code_item]
+        p, h, rows, col_code, col_ver, col_spawn, col_type, col_type2 = base_tables[fname]
+        br = rows[ridx]
+        changed = False
+        if (br.get(col_ver) or "").strip() != "0":
+            br[col_ver] = "0"
+            changed = True
+        if col_spawn:
+            if (br.get(col_spawn) or "").strip() != "1":
+                br[col_spawn] = "1"
+                changed = True
+        if changed:
+            enabled_bases += 1
+
+    # write base tables back
+    for fname, (p, h, rows, col_code, col_ver, col_spawn, col_type, col_type2) in base_tables.items():
+        write_tsv(p, h, rows)
+
+    report.append(f"[port-all] Phase1: enabled/ported uniques (non-ass/dru)={enabled_uniques}, base rows enabled/updated={enabled_bases}, skipped ass={skipped_ass}, skipped dru={skipped_dru}")
+    if skipped_bases:
+        report.append(f"[port-all] skipped_bases_class_locked(sample): {', '.join(sorted(list(skipped_bases))[:25])}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vanilla", required=True, help="Path to vanilla dump root containing data/ ...")
     ap.add_argument("--out", required=True, help="Output folder (a complete mod tree will be created here)")
     ap.add_argument("--cowtest", action="store_true", help="Enable Cow Level test drop injection (high base drops).")
+    ap.add_argument("--phase2drops", action="store_true", help="Phase 2: integrate ported bases into natural TreasureClassEx drops (safe: fills empty slots only; no NoDrop changes).")
     ap.add_argument("--enable-ui", action="store_true", help="Enable UI layout json overrides (default is disabled: files are renamed to disable*).")
     ap.add_argument("--patch-sources", default=str(Path(__file__).parent/"patch_sources"),
                     help="Folder containing cubemain.txt and UI json overrides")
@@ -2160,21 +2579,31 @@ def main():
 
     # 3) Apply locked patches to the mod root (vanilla schema already seeded)
     patch_misc_toa_version0(mod_root, report)
-    patch_uniqueitems_force_max_rolls(mod_root, report)
     patch_monstats_cow_xp_boost(mod_root, report, mult=9999)
     # --- Classic Elite Port: Shako base + Harlequin Crest + Cow Level incentive drop ---
     apply_classic_enable_shako_base(mod_root, report)
     apply_classic_enable_ancient_sword_base(mod_root, report)
+    apply_classic_enable_battle_boots_base(mod_root, report)
+    apply_classic_enable_ceremonial_javelin_base(mod_root, report)
+    apply_classic_port_lod_uniques_titan_wartrav_raven(mod_root, report)
     apply_classic_port_harlequin_crest(mod_root, report)
     apply_classic_port_atlantean_vanilla_key_r29_template(mod_root, report)
     apply_classic_host_tyrael_on_sacred_armor(mod_root, report)
     apply_force_tyrael_unique_lvlreq0(mod_root, report)
+    # Phase 1: Port ALL non-assassin/druid uniques + enable their canonical bases for Classic (forge-only).
+    apply_classic_port_all_uniques_except_assassin_druid(mod_root, report)
+    # Run unique max-roll pass AFTER LoD->Classic ports so newly-enabled uniques (e.g., The Atlantean) are included.
+    patch_uniqueitems_force_max_rolls(mod_root, report)
 
     apply_post_unique_maxrolls_for_targets(mod_root, report, ["Tyrael's Might"])
 
     apply_remove_unique_level_requirements(mod_root, report)
 
     apply_deterministic_peasant_and_harlequin_forge(mod_root, report)
+
+    validate_uniqueitems_invariants(mod_root, report)
+
+    apply_phase2_drop_integration(mod_root, report, args.phase2drops)
 
     apply_cow_test_drop_injection(mod_root, report, args.cowtest)
     patch_setitems_force_max_rolls(mod_root, report)
