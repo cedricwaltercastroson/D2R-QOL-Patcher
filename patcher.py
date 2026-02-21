@@ -1,5 +1,6 @@
 import random
 import re
+import os
 
 _VANILLA_ROOT = None  # set in main()
 import json
@@ -32,6 +33,7 @@ import argparse, csv, hashlib, json, re, shutil
 import csv
 import io
 from pathlib import Path
+import time
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 def read_tsv(path: Path):
@@ -1175,6 +1177,7 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
         return
 
     th, tc_rows, _ = read_tsv(p_tc)
+    orig_tc_len = len(tc_rows)
     tth, type_rows, _ = read_tsv(p_types)
 
     def normalize_column_key(k): return (k or "").strip().lstrip("\ufeff").lower().replace(" ", "")
@@ -1342,6 +1345,47 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
 
     # Build a balanced tree of sub-TCs to overcome slot limits
     existing_names = set((r.get(tc_key) or "").strip() for r in tc_rows)
+
+    # --- Safety/diagnostics: avoid item-code collisions with existing TreasureClass names ---
+    existing_names_lc = set(n.lower() for n in existing_names if n)
+    collisions = sorted([c for c in all_codes if c.lower() in existing_names_lc])
+    if collisions:
+        sample = ", ".join(collisions[:12]) + ("..." if len(collisions) > 12 else "")
+        report.append(f"[cow-all-bases] WARNING: {len(collisions)} base code(s) collide with existing TC names; skipping to avoid TC recursion/ambiguity. sample={sample}")
+        all_codes = [c for c in all_codes if c.lower() not in existing_names_lc]
+
+    # Optional allowlist to isolate crashes: place cow_all_bases_allowlist.txt next to patcher.py (one code per line).
+    try:
+        allow_path = Path(__file__).resolve().parent / "cow_all_bases_allowlist.txt"
+        if allow_path.exists():
+            allow = []
+            for ln in allow_path.read_text(encoding="utf-8").splitlines():
+                s = ln.strip().lower()
+                if not s or s.startswith("#"):
+                    continue
+                allow.append(s)
+            allow_set = set(allow)
+            before = len(all_codes)
+            all_codes = [c for c in all_codes if c.lower() in allow_set]
+            report.append(f"[cow-all-bases] allowlist active: {len(all_codes)}/{before} code(s) kept from {allow_path.name}")
+    except Exception as e:
+        report.append(f"[cow-all-bases] allowlist check failed (ignored): {e}")
+
+    
+    # Extra safety: exclude classic-unsafe misc categories even if they have unique/set mappings (e.g., charms, runes, jewels).
+    # These can crash Classic when enabled via expansion drops.
+    banned_types = {"jewl", "jewel", "charm", "rune"}
+    before_unsafe = len(all_codes)
+    all_codes = [c for c in all_codes if (base_codes.get(c, ("",""))[0] or "").strip().lower() not in banned_types
+                               and (base_codes.get(c, ("",""))[1] or "").strip().lower() not in banned_types]
+    removed_unsafe = before_unsafe - len(all_codes)
+    if removed_unsafe:
+        report.append(f"[cow-all-bases] filtered {removed_unsafe} classic-unsafe base code(s) by type (banned={sorted(banned_types)})")
+
+    # Re-split tiers after filtering
+    normal_codes = [c for c in all_codes if tier(c)=="normal"]
+    excep_codes  = [c for c in all_codes if tier(c)=="exceptional"]
+    elite_codes  = [c for c in all_codes if tier(c)=="elite"]
     def unique_name(base: str) -> str:
         n = base
         i = 1
@@ -1382,13 +1426,56 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
         tc_rows.append(make_tc_row(root, current, probs))
         return root
 
-    # Build tier roots
-    roots = {}
+    # Build tier roots using randomized pool partitioning to avoid runtime TC blow-ups.
+    # We shuffle codes per tier using a run-seed (logged) so pools are randomized per patch build.
+    try:
+        seed_env = os.environ.get("COW_ALLBASES_SEED", "").strip()
+        if seed_env:
+            cow_seed = int(seed_env)
+        else:
+            cow_seed = int(time.time()) & 0x7fffffff
+    except Exception:
+        cow_seed = int(time.time()) & 0x7fffffff
+
+    try:
+        pool_size = int(os.environ.get("COW_ALLBASES_POOL_SIZE", "45"))
+    except Exception:
+        pool_size = 45
+    if pool_size < max_slots:
+        pool_size = max_slots
+    if pool_size > 200:
+        pool_size = 200
+
+    rng = random.Random(cow_seed)
+
+    def partition_pools(codes: list[str]) -> list[list[str]]:
+        if not codes:
+            return []
+        _codes = codes[:]
+        rng.shuffle(_codes)
+        return [_codes[i:i+pool_size] for i in range(0, len(_codes), pool_size)]
+
+    roots = {}  # tier -> root tc name
+    pools_per_tier = {}
+
     for tag, codes in (("norm", normal_codes), ("excep", excep_codes), ("elite", elite_codes)):
         if not codes:
             continue
-        chunks = build_tc_chunks(f"zz_cow_allbases_{tag}", codes)
-        roots[tag] = build_tc_tree(f"zz_cow_allbases_{tag}", chunks)
+        pools = partition_pools(codes)
+        pools_per_tier[tag] = len(pools)
+        pool_roots = []
+        for pi, pcodes in enumerate(pools, start=1):
+            chunks = build_tc_chunks(f"zz_cow_allbases_{tag}_p{pi}", pcodes)
+            pool_root = build_tc_tree(f"zz_cow_allbases_{tag}_p{pi}", chunks)
+            pool_roots.append(pool_root)
+
+        # tier root selects ONE pool uniformly (tree if needed)
+        roots[tag] = build_tc_tree(f"zz_cow_allbases_{tag}_poolsel", pool_roots)
+
+    report.append(
+        f"[cow-all-bases] Pools randomized: seed={cow_seed} pool_size={pool_size} "
+        f"pools={{norm:{pools_per_tier.get('norm',0)} excep:{pools_per_tier.get('excep',0)} elite:{pools_per_tier.get('elite',0)}}}"
+    )
 
     # Difficulty wrappers
     def add_wrapper(name_base: str, w_norm: int, w_ex: int, w_el: int) -> str:
@@ -1446,6 +1533,14 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
                 lvl = 0
         return "H" if ("(h)" in n) else "N"
 
+
+    # Wrapper prob can be overridden for stability testing (env var).
+    try:
+        wrap_prob = int(os.environ.get("COW_ALLBASES_WRAP_PROB", "8192"))
+    except:
+        wrap_prob = 8192
+    if wrap_prob < 1: wrap_prob = 1
+    if wrap_prob > 32767: wrap_prob = 32767
     injected = 0
     for r in cow_rows:
         name = (r.get(tc_key) or "")
@@ -1463,14 +1558,14 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
             if (r.get(ic) or "").strip() != "":
                 continue
             r[ic] = wrapper
-            r[pc] = "8192"
+            r[pc] = str(wrap_prob)
             injected += 1
             break
 
     write_tsv(p_tc, th, tc_rows)
 
     report.append(f"[cow-all-bases] {'FULL CHAOS' if full_chaos else 'Scaled'}: codes={len(all_codes)} (norm={len(normal_codes)} excep={len(excep_codes)} elite={len(elite_codes)})")
-    report.append(f"[cow-all-bases] Added TC rows: {len(existing_names)} total names tracked; cow rows patched={injected} (wrapper prob=8192; empty-slot only)")
+    report.append(f"[cow-all-bases] Added TC rows: {len(tc_rows)-orig_tc_len} new row(s); cow rows patched={injected} (wrapper prob={wrap_prob}; empty-slot only)")
     report.append(f"[cow-all-bases] Wrappers: N={wrap_N} NM={wrap_NM} H={wrap_H}")
 
 
@@ -1602,6 +1697,29 @@ def apply_tc_enrichment_highlevel_bases(mod_root: Path, report: list[str], enabl
     if not eligible:
         report.append("[tc-enrichment] No eligible base codes found; skipped")
         return
+
+    # Exclude classic-unsafe misc categories even if Classic-enabled (e.g., unique jewel rows).
+    banned_misc_types = {"jewl", "jewel", "charm", "rune"}
+    before_unsafe = len(eligible)
+    eligible2 = []
+    for c in eligible:
+        if is_restricted_base(c):
+            continue
+        bi = base_index.get(c)
+        if not bi:
+            continue
+        tname, ridx = bi
+        _p, _h, rows_b, _col_code, col_type, col_type2 = base_tables[tname]
+        br = rows_b[ridx]
+        t1 = (br.get(col_type) or "").strip().lower() if col_type else ""
+        t2 = (br.get(col_type2) or "").strip().lower() if col_type2 else ""
+        if t1 in banned_misc_types or t2 in banned_misc_types:
+            continue
+        eligible2.append(c)
+    eligible = eligible2
+    removed_unsafe = before_unsafe - len(eligible)
+    if removed_unsafe:
+        report.append(f"[tc-enrichment] filtered {removed_unsafe} classic-unsafe base code(s) by type (banned={sorted(banned_misc_types)})")
 
     # Deterministic shuffle
     rng = random.Random(20260221)
@@ -1955,10 +2073,14 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
     skipped_dru = 0
     skipped_ass_prop = 0
     skipped_dru_prop = 0
+    skipped_unsafe_misc = 0
     skipped_bases = set()
     skipped_by_prop = []  # list[(unique_index, token)]
     missing_bases = set()
     touched_base_codes = set()
+
+    # Exclude expansion-only misc categories in Classic (even if a unique exists): jewels, charms, runes.
+    banned_misc_types = {"jewl", "jewel", "charm", "rune"}
 
     for r in rows_u:
         idx = (r.get(col_u_idx) or "").strip()
@@ -2013,6 +2135,17 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
         rec = base_index.get(code_item)
         if rec is None:
             missing_bases.add(code_item)
+            continue
+
+        # Exclude classic-unsafe misc types (jewel/charm/rune) even if present in uniqueitems (e.g., Rainbow Facet).
+        fname, ridx = rec
+        p_b, h_b, rows_b, col_code_b, col_ver_b, col_spawn_b, col_type_b, col_type2_b = base_tables[fname]
+        br_b = rows_b[ridx]
+        t1_b = (br_b.get(col_type_b) or "").strip().lower() if col_type_b else ""
+        t2_b = (br_b.get(col_type2_b) or "").strip().lower() if col_type2_b else ""
+        if t1_b in banned_misc_types or t2_b in banned_misc_types:
+            skipped_unsafe_misc += 1
+            skipped_by_prop.append((idx, t1_b if t1_b in banned_misc_types else t2_b))
             continue
 
         # exclude assassin/druid class-locked bases
@@ -2076,7 +2209,7 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
     for fname, (p, h, rows, col_code, col_ver, col_spawn, col_type, col_type2) in base_tables.items():
         write_tsv(p, h, rows)
 
-    report.append(f"[classic-port] enabled/ported uniques (non-ass/dru)={enabled_uniques}, base rows enabled/updated={enabled_bases}, skipped ass={skipped_ass}, skipped dru={skipped_dru}")
+    report.append(f"[classic-port] enabled/ported uniques (non-ass/dru)={enabled_uniques}, base rows enabled/updated={enabled_bases}, skipped ass={skipped_ass}, skipped dru={skipped_dru}, skipped unsafe misc={skipped_unsafe_misc}")
     if skipped_ass_prop or skipped_dru_prop:
         report.append(f"[classic-port] skipped_by_prop: ass={skipped_ass_prop}, dru={skipped_dru_prop} (class-skill uniques on shared bases)")
         sample = ", ".join([f"{u}({t})" for (u,t) in sorted(skipped_by_prop)[:40]])
