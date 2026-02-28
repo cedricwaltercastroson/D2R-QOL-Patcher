@@ -35,9 +35,9 @@ REM =========================================================
 REM  Default Baseline Toggles (locked until user says otherwise)
 REM =========================================================
 set ENABLE_EXPANSION_DROPS_IN_CLASSIC=1
-set COWALLBASES=0
-set COWCHAOS=0
-set EXP_DROPS_STAGE=1
+set COWALLBASES=1
+set COWCHAOS=1
+set EXP_DROPS_STAGE=4
 set UITOGGLE=0
 
 REM =========================================================

@@ -407,6 +407,19 @@ def patch_uniqueitems_force_max_rolls(mod_root: Path, report: list[str]) -> None
 
         row_changed = False
         for c in min_cols:
+            # Some property types encode two different semantics in min/max (e.g. chance-to-cast skills:
+            # min = chance, max = skill level). For these, do NOT force min=max.
+            try:
+                idx = int(c[3:])  # "min12" -> 12
+            except Exception:
+                idx = None
+            prop = (r.get(f"prop{idx}") or "").strip().lower() if idx else ""
+            if prop in {
+                "hit-skill", "gethit-skill", "kill-skill", "death-skill", "levelup-skill",
+                "att-skill", "strskill", "cast-skill", "charged",
+            }:
+                continue
+
             mx = "max" + c[3:]
             if mx not in hh:
                 continue
@@ -417,6 +430,7 @@ def patch_uniqueitems_force_max_rolls(mod_root: Path, report: list[str]) -> None
                 r[c] = mxv
                 changed_cells += 1
                 row_changed = True
+
 
         if row_changed:
             changed_rows += 1
@@ -456,6 +470,19 @@ def patch_setitems_force_max_rolls(mod_root: Path, report: list[str]) -> None:
 
         row_changed = False
         for c in min_cols:
+            # Some property types encode two different semantics in min/max (e.g. chance-to-cast skills:
+            # min = chance, max = skill level). For these, do NOT force min=max.
+            try:
+                idx = int(c[3:])  # "min12" -> 12
+            except Exception:
+                idx = None
+            prop = (r.get(f"prop{idx}") or "").strip().lower() if idx else ""
+            if prop in {
+                "hit-skill", "gethit-skill", "kill-skill", "death-skill", "levelup-skill",
+                "att-skill", "strskill", "cast-skill", "charged",
+            }:
+                continue
+
             mx = "max" + c[3:]
             if mx not in hh:
                 continue
@@ -466,6 +493,7 @@ def patch_setitems_force_max_rolls(mod_root: Path, report: list[str]) -> None:
                 r[c] = mxv
                 changed_cells += 1
                 row_changed = True
+
 
         if row_changed:
             changed_rows += 1
@@ -2747,7 +2775,6 @@ def main():
     elif len(_stage1_on) > 1:
         raise SystemExit(f"Stage-1 Cow Harness: set EXACTLY ONE STAGE1_* env toggle to 1 (got {', '.join(_stage1_on)})")
 
-
     # --- Expansion Drops in Classic: staged enablement ladder (for fast crash isolation) ---
     # If --enable-expansion-drops-in-classic is set, you can control which sub-features run via:
     #   EXP_DROPS_STAGE=1  -> LoD port layer only
@@ -2789,7 +2816,7 @@ def main():
         shutil.rmtree(out)
     out.mkdir(parents=True, exist_ok=True)
 
-    report = []
+    # report initialized earlier
     # 1) Copy full static mod tree (mods/<modname>/<modname>.mpq/... including modinfo.json)
     mod_subroot = find_mod_subroot(static_root)
     copy_static_payload(static_root, out, mod_subroot, report)
