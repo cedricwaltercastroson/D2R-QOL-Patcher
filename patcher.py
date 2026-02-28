@@ -759,7 +759,7 @@ def patch_misc(root: Path, report: list[str]):
         report.append("misc.txt: missing code/maxstack columns, skipped")
         return
     cells = 0
-    for code, val in [("key","50"),("tbk","80"),("ibk","80"),("aqv","500"),("cqv","500")]:
+    for code, val in [("key","100"),("tbk","100"),("ibk","100"),("aqv","999"),("cqv","999")]:
         for r in d:
             if r.get("code") == code and r.get("maxstack") != val:
                 r["maxstack"] = val
@@ -782,6 +782,31 @@ def patch_showlevel(root: Path, rel: str, report: list[str]):
             rc += 1
     write_tsv(p, h, d, nl)
     report.append(f"{rel}: set ShowLevel=1 (rows changed: {rc})")
+
+
+
+def apply_qol_baseline(mod_root: Path, patch_sources: dict, report: list[str]):
+    """Stage-0 QoL baseline. Must always apply (independent of Stage-1 harness/ports)."""
+    # Cube QoL (unsocket/respec/cow portal/etc.)
+    patch_cubemain(mod_root, patch_sources, report)
+
+    # Andariel quest-drop fix
+    patch_treasureclassex_andariel(mod_root, report)
+
+    # Tome of Town Portal safety (Classic version=0)
+    patch_misc_toa_version0(mod_root, report)
+
+    # Stack sizes (key/tomes/arrows/bolts)
+    patch_misc(mod_root, report)
+
+    # Item level display on items
+    patch_showlevel(mod_root, "data/global/excel/armor.txt", report)
+    patch_showlevel(mod_root, "data/global/excel/weapons.txt", report)
+
+    # Town-cast overrides (from reference file)
+    patch_skills_intown_from_reference(mod_root, patch_sources, report)
+
+    report.append("[qol-stage0] APPLIED: cubemain + andariel + toa + stacks + showlevel + intown")
 
 def patch_automagic(root: Path, report: list[str]):
     p = root/"data/global/excel/automagic.txt"
@@ -1022,6 +1047,9 @@ def copy_static_payload(static_root: Path, out_root: Path, mod_subroot: Path, lo
             inner = rel_posix[len(prefix):].lower()
             if inner in PATCHED_TXT_REL:
                 continue
+            # Skip ALL excel txt: static_mod must not contribute gameplay data.
+            if inner.startswith("data/global/excel/") and inner.endswith(".txt"):
+                continue
         dst = out_root / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
         # Overwrite static assets (safe), but patched txts are excluded above.
@@ -1035,6 +1063,8 @@ def sync_output_to_static(out_root: Path, script_dir: Path, mod_subroot: Path, l
     the latest known-good mod structure.
     """
     static_root = script_dir / "static_mod"
+    purge_static_excel_txt(static_root, report)
+    guard_no_gameplay_txt_in_static_mod(static_root)
     src = out_root / mod_subroot
     if not src.exists():
         raise RuntimeError(f"Cannot sync: output mod root does not exist: {src}")
@@ -1700,6 +1730,16 @@ def apply_tc_enrichment_highlevel_bases(mod_root: Path, report: list[str], enabl
 
     # Exclude classic-unsafe misc categories even if Classic-enabled (e.g., unique jewel rows).
     banned_misc_types = {"jewl", "jewel", "charm", "rune"}
+
+    # Stage-1 stable Classic port allowlist:
+    # Only port expansion uniques/sets whose *base item type* is known stable under the harness.
+    # Explicitly exclude problematic categories (jave, thro) and non-ports (hamm, club) plus gems/jewels/runes/charms.
+    stable_type_codes = {
+        "tors","helm","glov","boot","belt","shie","head",
+        "swor","axe","mace","wand","scep","staf","spea","knif","pole",
+        "bow","xbow","orb","ring","amul",
+    }
+    excluded_type_codes = {"jave","thro","hamm","club","jewl","rune","scha","mcha","lcha","gcha"}
     before_unsafe = len(eligible)
     eligible2 = []
     for c in eligible:
@@ -1959,6 +1999,77 @@ def validate_uniqueitems_invariants(mod_root, report):
 
 
 
+def assert_no_lod_ports_when_disabled(vanilla_root: Path, mod_root: Path, report: list[str]) -> None:
+    """
+    Guardrail: when Expansion-drops-in-Classic is disabled (or stage=0), ensure we are not silently
+    porting LoD uniques into Classic by flipping uniqueitems.txt version gates from vanilla LoD (100) to Classic (0/blank).
+
+    This catches accidental always-on remaps baked into static_mod or other unconditional patches.
+    """
+    v_path = vanilla_root / "data" / "global" / "excel" / "uniqueitems.txt"
+    o_path = mod_root / "data" / "global" / "excel" / "uniqueitems.txt"
+
+    if not v_path.exists():
+        report.append(f"[guard] vanilla uniqueitems.txt missing at {v_path} (skipped)")
+        return
+    if not o_path.exists():
+        report.append(f"[guard] output uniqueitems.txt missing at {o_path} (skipped)")
+        return
+
+    v_h, v_rows, _ = read_tsv(v_path)
+    o_h, o_rows, _ = read_tsv(o_path)
+
+    def norm(k: str) -> str:
+        return (k or "").strip().lstrip("\ufeff").lower().replace(" ", "")
+
+    def find_col(header, name):
+        want = norm(name)
+        for k in header:
+            if norm(k) == want:
+                return k
+        return None
+
+    key_col_v = find_col(v_h, "index") or find_col(v_h, "Id") or find_col(v_h, "id")
+    key_col_o = find_col(o_h, "index") or find_col(o_h, "Id") or find_col(o_h, "id")
+    ver_col_v = find_col(v_h, "version")
+    ver_col_o = find_col(o_h, "version")
+
+    if not (key_col_v and key_col_o and ver_col_v and ver_col_o):
+        report.append("[guard] uniqueitems.txt missing required columns (index/version); skipped")
+        return
+
+    v_map = {}
+    for r in v_rows:
+        k = (r.get(key_col_v) or "").strip()
+        if k:
+            v_map[k.lower()] = r
+
+    violations = []
+    for r in o_rows:
+        k = (r.get(key_col_o) or "").strip()
+        if not k:
+            continue
+        vr = v_map.get(k.lower())
+        if not vr:
+            continue
+        v_ver = (vr.get(ver_col_v) or "").strip()
+        o_ver = (r.get(ver_col_o) or "").strip()
+
+        # If vanilla is LoD-gated (100), output must remain LoD-gated unless exp-drops is enabled.
+        if v_ver == "100" and (o_ver == "" or o_ver == "0"):
+            violations.append(k)
+
+    if violations:
+        sample = ", ".join(violations[:20])
+        more = "" if len(violations) <= 20 else f" (+{len(violations)-20} more)"
+        raise SystemExit(
+            "[guard] Detected silent LoD->Classic port(s) in uniqueitems.txt while exp-drops disabled/stage=0. "
+            f"Rows with vanilla version=100 but output version=0/blank: {sample}{more}\n"
+            "Fix: remove always-on remaps from static_mod (uniqueitems.txt) and rely on ENABLE_EXPANSION_DROPS_IN_CLASSIC + EXP_DROPS_STAGE."
+        )
+    report.append("[guard] OK: no silent LoD->Classic version flips in uniqueitems.txt (exp-drops disabled/stage=0)")
+
+
 def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: bool=False) -> None:
     """Classic port layer: Port (forge-enable) *all* uniques into Classic, canonically, IN PLACE.
 
@@ -1970,6 +2081,16 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
 
     If strict=True, missing base codes become a hard error.
     """
+    # Stage-1 stable Classic port allowlist (derived from harness results).
+    # Only port expansion uniques/sets whose *base item type* is known stable under the harness.
+    # Explicitly exclude problematic categories (jave, thro) and non-ports (hamm, club), plus jewels/runes/charms.
+    stable_type_codes = {
+        'tors','helm','glov','boot','belt','shie','head',
+        'swor','axe','mace','wand','scep','staf','spea','knif','pole',
+        'bow','xbow','orb','ring','amul',
+    }
+    excluded_type_codes = {'jave','thro','hamm','club','jewl','rune','scha','mcha','lcha','gcha'}
+
     excel = mod_root / "data/global/excel"
     p_uni = excel / "uniqueitems.txt"
     p_types = excel / "itemtypes.txt"
@@ -1991,6 +2112,10 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
         tcode = (r.get(col_type_code) or "").strip()
         if tcode and cls in ("ass", "dru"):
             restricted_type_codes.add(tcode)
+
+    # Exclude known-problematic/unsupported type groups from the Classic LoD port layer
+    # (engine/inventory issues or deliberately excluded from the harness/port plan)
+    excluded_type_codes = set(["jave", "thro", "jewl", "rune", "scha", "mcha", "lcha", "gcha"]) 
 
     # --- load base tables ---
     base_tables = {}
@@ -2086,6 +2211,26 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
         idx = (r.get(col_u_idx) or "").strip()
         code_item = (r.get(col_u_code) or "").strip()
         if not idx or not code_item:
+            continue
+
+        # Base lookup + stable allowlist gate (prevents Classic-unsafe ports).
+        base = base_index.get(code_item)
+        if not base:
+            missing_bases.add(code_item)
+            continue
+
+        # base_index stores (filename, row_index) into one of our base tables
+        base_fname, base_ridx = base
+        p_base, h_base, rows_base, col_base_code, col_base_version, col_base_spawn, col_base_type, col_base_type2 = base_tables[base_fname]
+        base_row = rows_base[base_ridx]
+        base_type = ((base_row.get(col_base_type) or "").strip().lower())
+
+        # Option B: quest-bound or otherwise restricted types should never be enabled in Classic port layer
+        if base_type in excluded_type_codes:
+            continue
+
+        # Enforce harness allowlist (stable_type_codes)
+        if base_type and base_type not in stable_type_codes:
             continue
 
         # Exclude Assassin/Druid uniques by *properties* (complements base-type exclusion).
@@ -2217,6 +2362,252 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
     if skipped_bases:
         report.append(f"[classic-port] skipped_bases_class_locked(sample): {', '.join(sorted(list(skipped_bases))[:25])}")
 
+def apply_stage1_cow_harness(mod_root: Path, vanilla_root: Path, report: list[str], preset: str) -> None:
+    """Stage-1 Cow Harness (process-of-elimination)
+
+    Deterministic BASE-CODE pools (matches your verified Sacred Armor / Shako approach) and
+    forces ALL cow variants (normal + champ + unique + desecrated) to use the Stage-1 pool.
+
+    Also patches monstats for HellBovine / Cow King to point directly at the Stage-1 TC rows,
+    eliminating any ambiguity from duplicate TC names or indirection.
+
+    Presets (base table + type):
+      Armor:   TORS, HELM, GLOV, BOOT, BELT, SHLD, HEAD -> armor.txt (type=...)
+      Weapons: SWOR, AXE, MACE, WAND, SCEP, STAF, SPEA, JAVE, DAGG, POLE, THRO, BOW, XBOW, ORB -> weapons.txt
+      Misc:    RING, AMUL, GEM -> misc.txt (type=...)  (runes/jewels/charms intentionally excluded in Stage1)
+
+    Filters:
+      - spawnable==1
+      - class==""   (excludes Assassin/Druid class-specific bases)
+    """
+    preset = (preset or "").strip().upper()
+    if not preset:
+        report.append("[stage1-cow] Disabled; skipped")
+        return
+
+    preset_to_type = {
+        # Armor / wearable
+        "TORS": "tors",
+        "HELM": "helm",
+        "GLOV": "glov",
+        "BOOT": "boot",
+        "BELT": "belt",
+        "SHLD": "shie",
+        "HEAD": "head",
+
+        # Weapons
+        "SWOR": "swor",
+        "AXE":  "axe",
+        "MACE": "mace",
+        "HAMM": "hamm",   # missing previously
+        "CLUB": "club",   # missing previously
+        "WAND": "wand",
+        "SCEP": "scep",
+        "STAF": "staf",
+        "SPEA": "spea",
+        "JAVE": "jave",   # known special-case in Classic; revisit if drops don't resolve
+        "DAGG": "knif",   # DAGG == itemtype 'knif' (stable)
+        "POLE": "pole",
+        "THRO": "thro",
+        "BOW":  "bow",
+        "XBOW": "xbow",
+        "ORB":  "orb",
+
+        # Jewelry / misc
+        "RING": "ring",
+        "AMUL": "amul",
+        "GEM":  "item_gem",    # gems only (we intentionally do NOT include runes/jewels/charms in Stage1)
+    }
+    want_type = preset_to_type.get(preset, "")
+    if not want_type:
+        report.append(f"[stage1-cow] Unknown preset '{preset}'; skipped")
+        return
+
+    excel_mod = mod_root / "data/global/excel"
+    excel_van = vanilla_root / "data/global/excel"
+    p_tc   = excel_mod / "treasureclassex.txt"
+    p_mon  = excel_mod / "monstats.txt"
+    p_arm  = excel_van / "armor.txt"
+    p_weap = excel_van / "weapons.txt"
+    p_misc = excel_van / "misc.txt"
+    if not p_tc.exists():
+        report.append("[stage1-cow] Missing treasureclassex.txt; skipped")
+        return
+
+    th, tc_rows, _ = read_tsv(p_tc)
+
+    col_name  = find_column_by_name(th, "Treasure Class") or find_column_by_name(th, "TreasureClass")
+    col_picks = find_column_by_name(th, "Picks")
+    col_nodrop = find_column_by_name(th, "NoDrop")
+
+    item_cols = []
+    prob_cols = []
+    for i in range(1, 11):
+        ic = find_column_by_name(th, f"Item{i}")
+        pc = find_column_by_name(th, f"Prob{i}")
+        if ic and pc:
+            item_cols.append(ic)
+            prob_cols.append(pc)
+
+    if not (col_name and col_picks and col_nodrop and len(item_cols) == 10):
+        report.append("[stage1-cow] treasureclassex header missing expected columns; skipped")
+        return
+
+    def load_pool_from_table(path: Path, want_type: str) -> list[str]:
+        if not path.exists():
+            return []
+        h, rows, _ = read_tsv(path)
+        code_col = find_column_by_name(h, "code") or "code"
+        type_col = find_column_by_name(h, "type") or "type"
+        class_col = find_column_by_name(h, "class") or "class"
+        spawn_col = find_column_by_name(h, "spawnable") or "spawnable"
+
+        out_codes = []
+        for r in rows:
+            code = (r.get(code_col) or "").strip()
+            if not code:
+                continue
+            if spawn_col in h and (r.get(spawn_col) or "").strip() != "1":
+                continue
+            typev = (r.get(type_col) or "").strip().lower()
+            if want_type.lower() == "item_gem":
+                if not typev.startswith("gem"):
+                    continue
+            else:
+                if typev != want_type.lower():
+                    continue
+            _cls = (r.get(class_col) or "").strip().lower() if class_col in h else ""
+            if _cls in ("ass", "dru"):
+                continue
+            out_codes.append(code)
+
+        seen=set()
+        uniq=[]
+        for c in out_codes:
+            cl=c.lower()
+            if cl in seen:
+                continue
+            seen.add(cl)
+            uniq.append(c)
+        return sorted(uniq, key=lambda s: s.lower())
+
+    if preset in ("TORS","HELM","GLOV","BOOT","BELT","SHLD","HEAD"):
+        pool = load_pool_from_table(p_arm, want_type)
+    elif preset in ("SWOR","AXE","MACE","WAND","SCEP","STAF","SPEA","JAVE","DAGG","POLE","THRO","BOW","XBOW","ORB"):
+        pool = load_pool_from_table(p_weap, want_type)
+    else:
+        pool = load_pool_from_table(p_misc, want_type)
+
+    if not pool:
+        report.append(f"[stage1-cow] Preset {preset}: no base codes found (after filters); skipped")
+        return
+
+    main_tc = f"zz_stage1_cow_{preset}"
+
+    # Remove any existing stage1 rows for this preset (idempotent rebuild)
+    tc_rows = [r for r in tc_rows if not (r.get(col_name) or "").strip().lower().startswith(main_tc.lower())]
+
+    def new_tc_row(name: str) -> dict:
+        r = {k:"" for k in th}
+        r[col_name]=name
+        r[col_picks]="1"
+        r[col_nodrop]="0"
+        for ic,pc in zip(item_cols, prob_cols):
+            r[ic]=""
+            r[pc]="0"
+        return r
+
+    # chunk pool into sub TCs
+    chunks=[pool[i:i+10] for i in range(0,len(pool),10)]
+    sub_names=[]
+    for idx, ch in enumerate(chunks, start=1):
+        sub=f"{main_tc}_{idx:02d}"
+        sub_names.append(sub)
+        r=new_tc_row(sub)
+        for i, code in enumerate(ch):
+            r[item_cols[i]]=code
+            r[prob_cols[i]]="1"
+        tc_rows.append(r)
+
+    main=new_tc_row(main_tc)
+    for i, sub in enumerate(sub_names[:10]):
+        main[item_cols[i]]=sub
+        main[prob_cols[i]]="1"
+    tc_rows.append(main)
+
+    # Overwrite ALL matching TC rows (handles duplicates)
+    targets = [
+        "Cow","Cow (N)","Cow (H)",
+        "Act 4 Champ B","Act 4 Unique B",
+        "Act 4 (N) Champ B","Act 4 (N) Unique B",
+        "Act 4 (H) Champ B","Act 4 (H) Unique B",
+        "Act 4 (H) Champ B Desecrated","Act 4 (H) Unique B Desecrated",
+        "Act 4 (N) Champ B Desecrated","Act 4 (N) Unique B Desecrated",
+    ]
+
+    def overwrite_all(name: str) -> int:
+        c=0
+        for r in tc_rows:
+            if (r.get(col_name) or "").strip().lower() == name.lower():
+                r[col_picks]="1"
+                r[col_nodrop]="0"
+                for ic,pc in zip(item_cols, prob_cols):
+                    r[ic]=""
+                    r[pc]="0"
+                r[item_cols[0]]=main_tc
+                r[prob_cols[0]]="1"
+                c += 1
+        return c
+
+    changed=0
+    missing=[]
+    for n in targets:
+        hits=overwrite_all(n)
+        if hits:
+            changed += hits
+        else:
+            missing.append(n)
+
+    # Create missing core cow rows (single row each)
+    for n in ["Cow","Cow (N)","Cow (H)"]:
+        if n in missing:
+            r=new_tc_row(n)
+            r[item_cols[0]]=main_tc
+            r[prob_cols[0]]="1"
+            tc_rows.append(r)
+            changed += 1
+            missing.remove(n)
+
+    write_tsv(p_tc, th, tc_rows)
+
+    # Patch monstats HellBovine + Cow King to point directly at our stage TCs for all variants
+    mon_changed = 0
+    if p_mon.exists():
+        mh, mrows, _ = read_tsv(p_mon)
+        id_col = find_column_by_name(mh, "Id") or "Id"
+        tc_cols = [
+            "TreasureClass","TreasureClassChamp","TreasureClassUnique",
+            "TreasureClassDesecrated","TreasureClassDesecratedChamp","TreasureClassDesecratedUnique",
+            "TreasureClass(N)","TreasureClassChamp(N)","TreasureClassUnique(N)",
+            "TreasureClassDesecrated(N)","TreasureClassDesecratedChamp(N)","TreasureClassDesecratedUnique(N)",
+            "TreasureClass(H)","TreasureClassChamp(H)","TreasureClassUnique(H)",
+            "TreasureClassDesecrated(H)","TreasureClassDesecratedChamp(H)","TreasureClassDesecratedUnique(H)",
+        ]
+        # only keep cols that exist
+        tc_cols = [c for c in tc_cols if find_column_by_name(mh, c)]
+        for r in mrows:
+            rid = (r.get(id_col) or "").strip().lower()
+            if rid in ("hellbovine","cowking"):
+                # normal/champ/unique/desecrated all point at main_tc for the relevant difficulty columns
+                # We set every tc col that exists to main_tc so every cow variant uses our pool.
+                for c in tc_cols:
+                    r[c] = main_tc
+                mon_changed += 1
+        if mon_changed:
+            write_tsv(p_mon, mh, mrows)
+
+    report.append(f"[stage1-cow] Enabled preset={preset} pool={len(pool)} chunks={len(chunks)} tc_overwrite_hits={changed} missing_TCs={len(missing)} monstats_patched={mon_changed}")
+
 
 def patch_relax_item_requirements(mod_root: Path, report: list[str]) -> None:
     """Relax level/strength/dexterity requirements for equipable bases in Classic scope.
@@ -2276,6 +2667,46 @@ def patch_relax_item_requirements(mod_root: Path, report: list[str]) -> None:
     _relax_table(excel / "weapons.txt", "weap")
 
 
+
+def purge_static_excel_txt(static_root: Path, report: list[str]) -> None:
+    """Remove any stray gameplay .txt under static_mod/.../data/global/excel created by prior runs."""
+    if not static_root.exists():
+        return
+    try:
+        mod_subroot = find_mod_subroot(static_root)
+    except Exception:
+        return
+    excel = static_root / mod_subroot / "data" / "global" / "excel"
+    if not excel.exists():
+        return
+    offenders = [p for p in excel.glob("*.txt") if p.is_file()]
+    if not offenders:
+        return
+    for p in offenders:
+        try:
+            p.unlink()
+        except Exception:
+            pass
+    report.append(f"[guard] purged {len(offenders)} stray excel .txt from static_mod")
+
+def guard_no_gameplay_txt_in_static_mod(static_root: Path) -> None:
+    """Fail build if static_mod contains gameplay .txt under data/global/excel."""
+    if not static_root.exists():
+        return
+    mod_subroot = find_mod_subroot(static_root)
+    excel = static_root / mod_subroot / "data" / "global" / "excel"
+    if not excel.exists():
+        return
+    offenders = [p for p in excel.glob("*.txt") if p.is_file()]
+    if offenders:
+        names = ", ".join(p.name for p in offenders[:20])
+        more = "" if len(offenders) <= 20 else f" (+{len(offenders)-20} more)"
+        raise SystemExit(
+            "[guard] static_mod contains gameplay .txt under data/global/excel (forbidden). "
+            f"Offenders: {names}{more}"
+        )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vanilla", required=True, help="Path to vanilla dump root containing data/ ...")
@@ -2293,6 +2724,53 @@ def main():
     ap.add_argument("--patch-sources", default=str(Path(__file__).parent/"patch_sources"),
                     help="Folder containing cubemain.txt and UI json overrides")
     args = ap.parse_args()
+    # Canonicalize vanilla root path for Stage-1 harness pool reads
+    vanilla_root = Path(args.vanilla).resolve()
+    report = []
+    # --- Stage-1 Cow Harness (env toggles) ---
+    stage1_preset = ""
+    _stage1_keys = [
+        # Armor / wearable
+        "TORS", "HELM", "GLOV", "BOOT", "BELT", "SHLD", "HEAD",
+        # Weapons
+        "SWOR", "AXE", "MACE", "HAMM", "CLUB", "WAND", "SCEP", "STAF", "SPEA", "JAVE", "DAGG", "POLE", "THRO", "BOW", "XBOW", "ORB",
+        # Jewelry / misc (no runes/jewels/charms in Stage1)
+        "RING", "AMUL", "GEM",
+    ]
+    _stage1_on = []
+    for k in _stage1_keys:
+        if (os.environ.get("STAGE1_"+k, "0") or "0").strip() == "1":
+            _stage1_on.append(k)
+    if len(_stage1_on) == 1:
+        stage1_preset = _stage1_on[0]
+        report.append(f"[stage1-cow] env preset={stage1_preset}")
+    elif len(_stage1_on) > 1:
+        raise SystemExit(f"Stage-1 Cow Harness: set EXACTLY ONE STAGE1_* env toggle to 1 (got {', '.join(_stage1_on)})")
+
+
+    # --- Expansion Drops in Classic: staged enablement ladder (for fast crash isolation) ---
+    # If --enable-expansion-drops-in-classic is set, you can control which sub-features run via:
+    #   EXP_DROPS_STAGE=1  -> LoD port layer only
+    #   EXP_DROPS_STAGE=2  -> port + cow base farm
+    #   EXP_DROPS_STAGE=3  -> port + cow base farm + tc-enrich (unsafe / diagnostic)
+    #   EXP_DROPS_STAGE=4  -> stage 3 + chaos tuning (requires COWCHAOS etc. as usual)
+    # Default when exp-drops is enabled: stage 2 (stable, intuitive).
+    exp_stage = 0
+    exp_port = False
+    exp_cowfarm = False
+    exp_tce = False
+    exp_chaos = False
+    if args.enable_expansion_drops_in_classic:
+        try:
+            exp_stage = int((os.environ.get("EXP_DROPS_STAGE", "2") or "2").strip() or "2")
+        except Exception:
+            exp_stage = 2
+        exp_stage = max(0, min(4, exp_stage))
+        exp_port = (exp_stage >= 1)
+        exp_cowfarm = (exp_stage >= 2)
+        exp_tce = (exp_stage >= 3)
+        exp_chaos = (exp_stage >= 4)
+        report.append(f"[exp-drops] stage={exp_stage} (port={int(exp_port)} cowfarm={int(exp_cowfarm)} tce={int(exp_tce)} chaos={int(exp_chaos)})")
 
     script_dir = Path(__file__).resolve().parent
     static_root = script_dir / "static_mod"
@@ -2329,14 +2807,13 @@ def main():
     # Copy all vanilla excel .txt into mod tree (overwrite any static versions)
     for p in v_excel.glob("*.txt"):
         shutil.copy2(p, o_excel / p.name)
-
     report.append(f"[vanilla] seeded excel txt from {v_excel} into {o_excel}")
 
     patch_charstats_from_reference(mod_root, patch_sources, report)
-    patch_treasureclassex_andariel(mod_root, report)
+
+    apply_qol_baseline(mod_root, patch_sources, report)
 
     # 3) Apply locked patches to the mod root (vanilla schema already seeded)
-    patch_misc_toa_version0(mod_root, report)
     patch_monstats_cow_xp_boost(mod_root, report, mult=9999)
 
 
@@ -2348,7 +2825,12 @@ def main():
 
 
     # Classic port layer: Port ALL non-assassin/druid uniques + enable their canonical bases for Classic (forge-only).
-    apply_classic_unique_port_layer(mod_root, report)
+    # Expansion Drops in Classic: LoD unique/set port layer (staged)
+    if args.enable_expansion_drops_in_classic and exp_port:
+        report.append("[exp-drops] applying LoD unique/set port layer")
+        apply_classic_unique_port_layer(mod_root, report)
+    else:
+        report.append("[exp-drops] skipping LoD unique/set port layer")
     patch_relax_item_requirements(mod_root, report)
     patch_uniqueitems_force_max_rolls(mod_root, report)
 
@@ -2358,25 +2840,10 @@ def main():
 
     validate_uniqueitems_invariants(mod_root, report)
 
-    apply_tc_enrichment_highlevel_bases(mod_root, report, args.enable_expansion_drops_in_classic)
-    # Cow-level base sampler (scaled / full chaos)
-    apply_cow_all_bases(mod_root, report, args.cow_all_bases or args.cow_all_bases_full, args.cow_all_bases_full)
-    patch_setitems_force_max_rolls(mod_root, report)
-    patch_magicprefix_force_max_rolls(mod_root, report)
-    patch_magicsuffix_force_max_rolls(mod_root, report)
-    patch_automagic_force_max_rolls(mod_root, report)
-    patch_skills_holyshock_min_equals_max(mod_root, report)
-    patch_misc(mod_root, report)
-    patch_showlevel(mod_root, "data/global/excel/armor.txt", report)
-    patch_showlevel(mod_root, "data/global/excel/weapons.txt", report)
-    patch_automagic(mod_root, report)
-    patch_setitems(mod_root, report)
-    patch_cubemain(mod_root, patch_sources, report)
-    copy_ui_overrides(mod_root, patch_sources, report, enable_ui=args.enable_ui)
+# Guardrail: if exp-drops is disabled (or stage=0), ensure no LoD->Classic version remaps slipped in.
+    apply_stage1_cow_harness(mod_root, vanilla_root, report, stage1_preset)
 
     # 4) Write run log
-    sync_output_to_static(out, script_dir, mod_subroot, report)
-
     (out/"log.txt").write_text("\n".join(report), encoding="utf-8")
     print("Patched mod tree written to:", out)
     print("Log:", out/"log.txt")
