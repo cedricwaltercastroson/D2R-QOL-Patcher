@@ -783,7 +783,7 @@ def patch_misc(root: Path, report: list[str]):
         report.append("misc.txt: missing code/maxstack columns, skipped")
         return
     cells = 0
-    for code, val in [("key","50"),("tbk","80"),("ibk","80"),("aqv","500"),("cqv","500")]:
+    for code, val in [("key","100"),("tbk","100"),("ibk","100"),("aqv","999"),("cqv","999")]:
         for r in d:
             if r.get("code") == code and r.get("maxstack") != val:
                 r["maxstack"] = val
