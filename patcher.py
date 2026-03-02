@@ -36,34 +36,26 @@ from pathlib import Path
 import time
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-
-
-# ---------------------------------------------------------------------------
-# Canonical eligibility gates for Classic LoD ports (Stage-1 "known stable").
-# These lists are the single source of truth for what itemtype codes are allowed
-# to be ported/enriched when Expansion drops are enabled, regardless of harness.
-# Harness toggles only affect routing/auditing, not port eligibility.
-# ---------------------------------------------------------------------------
-
+# --- Stage-1 harness stability allow/deny lists (single source of truth) ---
+# These drive Classic LoD port gating AND any drop/TC enrichment that depends on "ported" bases.
+# Keep these in sync with the Stage-1 ledger.
 STAGE1_STABLE_TYPE_CODES = {
-    "tors","helm","glov","boot","belt","shie","head",
-    "swor","axe","mace","wand","scep","staf","spea","knif","pole",
-    "bow","xbow","orb","ring","amul","hamm",
+    'tors','helm','glov','boot','belt','shie','head',
+    'swor','axe','mace','wand','scep','staf','spea','knif','pole',
+    'bow','xbow','orb','ring','amul','hamm',
 }
+# Categories we never port/enrich in Stage-1 (known-crashy or explicitly excluded pools)
+STAGE1_EXCLUDED_TYPE_CODES = {'jave','thro','club','jewl','rune','scha','mcha','lcha','gcha'}
 
-# Permanently excluded / known problematic categories (crash/inventory/plan exclusions)
-STAGE1_EXCLUDED_TYPE_CODES = {"jave","thro","club","jewl","rune","scha","mcha","lcha","gcha"}
-
-# Misc-type bans: even if a base is otherwise eligible, these are excluded from Classic distribution.
-BANNED_MISC_TYPES = {"jewl", "jewel", "charm", "rune"}
 
 def _validate_stage1_type_lists(report: list[str] | None = None) -> None:
     overlap = STAGE1_STABLE_TYPE_CODES.intersection(STAGE1_EXCLUDED_TYPE_CODES)
     if overlap:
-        raise RuntimeError(f"PATCHER ASSERTION FAILED: STAGE1_STABLE_TYPE_CODES overlaps STAGE1_EXCLUDED_TYPE_CODES: {sorted(overlap)}")
+        raise RuntimeError(f"PATCHER ASSERTION FAILED: Stage-1 stable/excluded type lists overlap: {sorted(overlap)}")
     if report is not None:
-        report.append(f"[eligibility] STAGE1_STABLE_TYPE_CODES={sorted(STAGE1_STABLE_TYPE_CODES)}")
-        report.append(f"[eligibility] STAGE1_EXCLUDED_TYPE_CODES={sorted(STAGE1_EXCLUDED_TYPE_CODES)}")
+        report.append(f"[stage1-allowlist] stable_types={len(STAGE1_STABLE_TYPE_CODES)} excluded_types={len(STAGE1_EXCLUDED_TYPE_CODES)}")
+
+
 
 def read_tsv(path: Path):
     text = path.read_text(encoding="utf-8-sig")
@@ -842,7 +834,7 @@ def patch_showlevel(root: Path, rel: str, report: list[str]):
 
 
 
-def apply_qol_baseline(mod_root: Path, patch_sources: dict, report: list[str]):
+def apply_qol_baseline(mod_root: Path, patch_sources: Path, report: list[str]):
     """Stage-0 QoL baseline. Must always apply (independent of Stage-1 harness/ports)."""
     # Cube QoL (unsocket/respec/cow portal/etc.)
     patch_cubemain(mod_root, patch_sources, report)
@@ -963,8 +955,15 @@ def patch_cubemain(root: Path, patch_sources: Path, report: list[str]) -> None:
         report.append("[cubemain] empty base/patch (skipped)")
         return
 
-    # Compute stable signature from common columns
-    # Keep it conservative: only columns that define recipe identity & behavior.
+    # Compute stable signature from common columns (schema-robust)
+    # We map by normalized header keys (case/space/BOM-insensitive) so minor vanilla header drift
+    # (e.g. "min diff" vs "mindiff") can't break recipe identity or row materialization.
+    def _norm(k: str) -> str:
+        return normalize_column_key(k)
+
+    base_norm = {_norm(k): k for k in h_base}
+    patch_norm = {_norm(k): k for k in h_patch}
+
     sig_cols = [
         "enabled", "ladder", "min diff", "version", "op", "param",
         "numinputs",
@@ -973,27 +972,43 @@ def patch_cubemain(root: Path, patch_sources: Path, report: list[str]) -> None:
         "lvl", "plvl", "ilvl",
     ]
 
-    common = [c for c in sig_cols if c in h_base and c in h_patch]
-    # Fallback if headers differ slightly: include any input/output columns present
-    if not common:
-        common = [c for c in h_base if c.lower().startswith("input") or c.lower() == "output"]
-        common = [c for c in common if c in h_patch]
+    # Build signature column pairs (base_key, patch_key) for columns present in BOTH schemas.
+    sig_pairs = []
+    for c in sig_cols:
+        nk = _norm(c)
+        if nk in base_norm and nk in patch_norm:
+            sig_pairs.append((base_norm[nk], patch_norm[nk]))
 
-    def sig(row: dict) -> tuple:
-        return tuple((row.get(c, "") or "").strip() for c in common)
+    # Fallback if nothing matched: use any input/output columns present in both by normalized key.
+    if not sig_pairs:
+        for bk in h_base:
+            nbk = _norm(bk)
+            if nbk.startswith("input") or nbk == "output":
+                if nbk in patch_norm:
+                    sig_pairs.append((bk, patch_norm[nbk]))
 
-    base_sigs = {sig(r) for r in d_base}
+    def _sig_base(row: dict) -> tuple:
+        return tuple((row.get(bk, "") or "").strip() for (bk, _) in sig_pairs)
+
+    def _sig_patch(row: dict) -> tuple:
+        return tuple((row.get(pk, "") or "").strip() for (_, pk) in sig_pairs)
+
+    base_sigs = {_sig_base(r) for r in d_base}
 
     to_add = []
+    enabled_key_patch = patch_norm.get(_norm("enabled"), "enabled")
+    output_key_patch = patch_norm.get(_norm("output"), "output")
+
     for r in d_patch:
         # only add enabled rows (enabled == "1")
-        if str(r.get("enabled", "")).strip() != "1":
-            continue
-        s = sig(r)
-        if s in base_sigs:
+        if str(r.get(enabled_key_patch, "")).strip() != "1":
             continue
         # ensure the patch row has at least an output field
-        if "output" in h_patch and (r.get("output") is None or str(r.get("output")).strip() == ""):
+        if (r.get(output_key_patch) is None) or (str(r.get(output_key_patch)).strip() == ""):
+            continue
+
+        s = _sig_patch(r)
+        if s in base_sigs:
             continue
         to_add.append(r)
         base_sigs.add(s)
@@ -1002,10 +1017,28 @@ def patch_cubemain(root: Path, patch_sources: Path, report: list[str]) -> None:
         report.append("[cubemain] no new recipes to inject (already present)")
         return
 
-    # Append patch rows using base header ordering; missing keys become blank
-    out_rows = d_base + [{k: (r.get(k, "") if k in r else "") for k in h_base} for r in to_add]
+    # Append patch rows using base header ordering, mapping by normalized header key
+    def _materialize_row(patch_row: dict) -> dict:
+        out = {}
+        for bk in h_base:
+            nbk = _norm(bk)
+            pk = patch_norm.get(nbk)
+            out[bk] = patch_row.get(pk, "") if pk is not None else ""
+        return out
+
+    out_rows = d_base + [_materialize_row(r) for r in to_add]
     write_tsv(dst, h_base, out_rows)
     report.append(f"[cubemain] injected custom recipes (added rows: {len(to_add)})")
+
+    # Hard validation: ensure forge recipes survived schema mapping
+    # (prevents "injected but blank/invalid" regressions)
+    try:
+        _, chk_rows, _ = read_tsv(dst)
+        blob = "\n".join(" ".join(str(v) for v in row.values()) for row in chk_rows if str(row.get(base_norm.get(_norm('enabled'),'enabled'), '')).strip() == '1')
+        if ("usetype,uni" not in blob) or ("usetype,set" not in blob):
+            report.append("[cubemain-validate] WARNING: expected forge outputs (usetype,uni / usetype,set) not found after injection")
+    except Exception as e:
+        report.append(f"[cubemain-validate] WARNING: validation failed: {e}")
 
 
 def copy_ui_overrides(root: Path, patch_sources: Path, report: list[str], enable_ui: bool = False):
@@ -1232,6 +1265,58 @@ def apply_remove_unique_level_requirements(mod_root, report):
     return True
 
 
+
+
+
+def apply_remove_set_level_requirements(mod_root, report):
+    """Remove level requirements for ALL Classic sets (setitems.txt).
+
+    Sets lvlreq (aka "lvl req") to 0 for every Classic-enabled set row (version==0 or blank).
+    This does not touch base item requirements (armor/weapons), only the set item's required level.
+    """
+    p = mod_root / "data/global/excel/setitems.txt"
+    if not p.exists():
+        report.append("[set-lvlreq] setitems.txt not found; skipping")
+        return False
+
+    h, rows, _ = read_tsv(p)
+
+    def norm_key(k):
+        return (k or "").strip().lstrip("\ufeff").lower().replace(" ", "")
+
+    def pick(*names):
+        wanted = set(names)
+        for k in h:
+            if norm_key(k) in wanted:
+                return k
+        return None
+
+    ver_key = pick("version")
+    req_key = pick("lvlreq", "levelreq", "reqlevel", "reqlvl", "lvlreq", "lvlreq", "lvl req")
+
+    if ver_key is None or req_key is None:
+        report.append("[set-lvlreq] setitems missing required columns (need version + lvlreq); skipping")
+        return False
+
+    def is_classic(r):
+        v = (r.get(ver_key) or "").strip()
+        return v == "" or v == "0"
+
+    changed_rows = 0
+    for r in rows:
+        if not is_classic(r):
+            continue
+        if (r.get(req_key) or "").strip() != "0":
+            r[req_key] = "0"
+            changed_rows += 1
+
+    if changed_rows == 0:
+        report.append("[set-lvlreq] No Classic set lvlreq values needed changing")
+        return True
+
+    write_tsv(p, h, rows)
+    report.append(f"[set-lvlreq] Set lvlreq=0 for {changed_rows} Classic set row(s)")
+    return True
 
 def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_chaos: bool) -> None:
     """Cow-only base item sampler (deterministic TC-friendly pool builder).
@@ -1754,38 +1839,67 @@ def apply_tc_enrichment_highlevel_bases(mod_root: Path, report: list[str], enabl
         t2 = (br.get(col_type2) or "").strip()
         return (t1 in restricted_type_codes) or (t2 in restricted_type_codes)
 
-    # Collect eligible base codes from base tables directly (gated variety):
-    # A base is eligible if its type/type2 is in the stable allowlist, even if it has no unique/set mapping.
-    _validate_stage1_type_lists(report)
-    stable_type_codes = STAGE1_STABLE_TYPE_CODES
-    excluded_type_codes = STAGE1_EXCLUDED_TYPE_CODES
-    banned_misc_types = BANNED_MISC_TYPES
+    # Collect eligible base codes from Classic-enabled uniques (exclude ass/dru locked bases)
+    ver_key = find_column_by_name(uh, "version")
+    code_key = find_column_by_name(uh, "code")
+    en_key = next((k for k in uh if normalize_column_key(k) in ("enabled","enabled1")), None)
+
+    if not ver_key or not code_key:
+        report.append("[tc-enrichment] uniqueitems missing version/code; skipped")
+        return
 
     eligible = []
     seen = set()
-    for tname, (p_b, h_b, rows_b, col_code_b, col_ver_b, col_spawn_b, col_type_b, col_type2_b) in base_tables.items():
-        for br in rows_b:
-            c = (br.get(col_code_b) or "").strip().lower()
-            if not c or c in seen:
+    for r in urows:
+        v = (r.get(ver_key) or "").strip()
+        if v not in ("", "0"):
+            continue
+        if en_key:
+            ev = (r.get(en_key) or "").strip()
+            if ev not in ("", "1"):
                 continue
-            t1 = (br.get(col_type_b) or "").strip().lower() if col_type_b else ""
-            t2 = (br.get(col_type2_b) or "").strip().lower() if col_type2_b else ""
-            if t1 in banned_misc_types or t2 in banned_misc_types:
-                continue
-            if t1 in excluded_type_codes or t2 in excluded_type_codes:
-                continue
-            if (t1 not in stable_type_codes) and (t2 not in stable_type_codes):
-                continue
-            if is_restricted_base(c):
-                continue
-            seen.add(c)
-            eligible.append(c)
+        c = (r.get(code_key) or "").strip().lower()
+        if not c or c in seen:
+            continue
+        if is_restricted_base(c):
+            continue
+        seen.add(c)
+        eligible.append(c)
 
     if not eligible:
         report.append("[tc-enrichment] No eligible base codes found; skipped")
         return
 
-# Deterministic shuffle
+    # Exclude classic-unsafe misc categories even if Classic-enabled (e.g., unique jewel rows).
+    banned_misc_types = {"jewl", "jewel", "charm", "rune"}
+
+    # Stage-1 stable Classic port allowlist:
+    # Only port expansion uniques/sets whose *base item type* is known stable under the harness.
+    # Explicitly exclude problematic categories (jave, thro) and non-ports (hamm, club) plus gems/jewels/runes/charms.
+    stable_type_codes = STAGE1_STABLE_TYPE_CODES
+    excluded_type_codes = STAGE1_EXCLUDED_TYPE_CODES
+    before_unsafe = len(eligible)
+    eligible2 = []
+    for c in eligible:
+        if is_restricted_base(c):
+            continue
+        bi = base_index.get(c)
+        if not bi:
+            continue
+        tname, ridx = bi
+        _p, _h, rows_b, _col_code, col_type, col_type2 = base_tables[tname]
+        br = rows_b[ridx]
+        t1 = (br.get(col_type) or "").strip().lower() if col_type else ""
+        t2 = (br.get(col_type2) or "").strip().lower() if col_type2 else ""
+        if t1 in banned_misc_types or t2 in banned_misc_types:
+            continue
+        eligible2.append(c)
+    eligible = eligible2
+    removed_unsafe = before_unsafe - len(eligible)
+    if removed_unsafe:
+        report.append(f"[tc-enrichment] filtered {removed_unsafe} classic-unsafe base code(s) by type (banned={sorted(banned_misc_types)})")
+
+    # Deterministic shuffle
     rng = random.Random(20260221)
     eligible_sorted = sorted(eligible)
     rng.shuffle(eligible_sorted)
@@ -1841,6 +1955,7 @@ def apply_tc_enrichment_highlevel_bases(mod_root: Path, report: list[str], enabl
 
 def apply_post_unique_maxrolls_for_targets(mod_root: Path, report: list[str], target_names: list[str]) -> None:
     """
+    _validate_stage1_type_lists(report)
     Post-pass maxroll fixer for specific unique rows (Classic-only).
     still get min=max applied.
     """
@@ -2108,13 +2223,8 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
     # Stage-1 stable Classic port allowlist (derived from harness results).
     # Only port expansion uniques/sets whose *base item type* is known stable under the harness.
     # Explicitly exclude problematic categories (jave, thro) and non-ports (hamm, club), plus jewels/runes/charms.
-    stable_type_codes = {
-        'tors','helm','glov','boot','belt','shie','head',
-        'swor','axe','mace','wand','scep','staf','spea','knif','pole',
-        'bow','xbow','orb','ring','amul',
-    }
-    excluded_type_codes = {'jave','thro','hamm','club','jewl','rune','scha','mcha','lcha','gcha'}
-
+    stable_type_codes = STAGE1_STABLE_TYPE_CODES
+    excluded_type_codes = STAGE1_EXCLUDED_TYPE_CODES
     excel = mod_root / "data/global/excel"
     p_uni = excel / "uniqueitems.txt"
     p_types = excel / "itemtypes.txt"
@@ -2136,9 +2246,11 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
         tcode = (r.get(col_type_code) or "").strip()
         if tcode and cls in ("ass", "dru"):
             restricted_type_codes.add(tcode)
+
     # Exclude known-problematic/unsupported type groups from the Classic LoD port layer
     # (engine/inventory issues or deliberately excluded from the harness/port plan)
-    # NOTE: single-source-of-truth lists are defined at module scope.
+    excluded_type_codes = set(["jave", "thro", "jewl", "rune", "scha", "mcha", "lcha", "gcha"]) 
+
     # --- load base tables ---
     base_tables = {}
     base_index = {}  # code -> (table_key, row_idx)
@@ -2225,8 +2337,10 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
     skipped_by_prop = []  # list[(unique_index, token)]
     missing_bases = set()
     touched_base_codes = set()
+
     # Exclude expansion-only misc categories in Classic (even if a unique exists): jewels, charms, runes.
-    banned_misc_types = BANNED_MISC_TYPES
+    banned_misc_types = {"jewl", "jewel", "charm", "rune"}
+
     for r in rows_u:
         idx = (r.get(col_u_idx) or "").strip()
         code_item = (r.get(col_u_code) or "").strip()
@@ -2369,39 +2483,6 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
                 changed = True
         if changed:
             enabled_bases += 1
-
-    # Additionally, enable ALL bases whose itemtype is in the stable allowlist, even if they do not
-    # currently have a unique/set mapping. This preserves gated variety while keeping the eligibility
-    # contract consistent with the harness-validated stable set.
-    for fname, (p, h, rows, col_code, col_ver, col_spawn, col_type, col_type2) in base_tables.items():
-        for br in rows:
-            c = (br.get(col_code) or "").strip()
-            if not c:
-                continue
-            t1 = (br.get(col_type) or "").strip().lower() if col_type else ""
-            t2 = (br.get(col_type2) or "").strip().lower() if col_type2 else ""
-            # Exclude banned misc types outright
-            if t1 in banned_misc_types or t2 in banned_misc_types:
-                continue
-            # Skip excluded/problematic families
-            if t1 in excluded_type_codes or t2 in excluded_type_codes:
-                continue
-            # Must match stable allowlist on either type slot
-            if (t1 not in stable_type_codes) and (t2 not in stable_type_codes):
-                continue
-            # Skip ass/dru class-locked bases
-            if is_restricted_base(c):
-                continue
-            changed = False
-            if (br.get(col_ver) or "").strip() != "0":
-                br[col_ver] = "0"
-                changed = True
-            if col_spawn:
-                if (br.get(col_spawn) or "").strip() != "1":
-                    br[col_spawn] = "1"
-                    changed = True
-            if changed:
-                enabled_bases += 1
 
     # write base tables back
     for fname, (p, h, rows, col_code, col_ver, col_spawn, col_type, col_type2) in base_tables.items():
@@ -2916,6 +2997,8 @@ def main():
 
 
     apply_remove_unique_level_requirements(mod_root, report)
+
+    apply_remove_set_level_requirements(mod_root, report)
 
 
     validate_uniqueitems_invariants(mod_root, report)
