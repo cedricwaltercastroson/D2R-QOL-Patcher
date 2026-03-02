@@ -36,6 +36,35 @@ from pathlib import Path
 import time
 SCRIPT_DIR = Path(__file__).resolve().parent
 
+
+
+# ---------------------------------------------------------------------------
+# Canonical eligibility gates for Classic LoD ports (Stage-1 "known stable").
+# These lists are the single source of truth for what itemtype codes are allowed
+# to be ported/enriched when Expansion drops are enabled, regardless of harness.
+# Harness toggles only affect routing/auditing, not port eligibility.
+# ---------------------------------------------------------------------------
+
+STAGE1_STABLE_TYPE_CODES = {
+    "tors","helm","glov","boot","belt","shie","head",
+    "swor","axe","mace","wand","scep","staf","spea","knif","pole",
+    "bow","xbow","orb","ring","amul","hamm",
+}
+
+# Permanently excluded / known problematic categories (crash/inventory/plan exclusions)
+STAGE1_EXCLUDED_TYPE_CODES = {"jave","thro","club","jewl","rune","scha","mcha","lcha","gcha"}
+
+# Misc-type bans: even if a base is otherwise eligible, these are excluded from Classic distribution.
+BANNED_MISC_TYPES = {"jewl", "jewel", "charm", "rune"}
+
+def _validate_stage1_type_lists(report: list[str] | None = None) -> None:
+    overlap = STAGE1_STABLE_TYPE_CODES.intersection(STAGE1_EXCLUDED_TYPE_CODES)
+    if overlap:
+        raise RuntimeError(f"PATCHER ASSERTION FAILED: STAGE1_STABLE_TYPE_CODES overlaps STAGE1_EXCLUDED_TYPE_CODES: {sorted(overlap)}")
+    if report is not None:
+        report.append(f"[eligibility] STAGE1_STABLE_TYPE_CODES={sorted(STAGE1_STABLE_TYPE_CODES)}")
+        report.append(f"[eligibility] STAGE1_EXCLUDED_TYPE_CODES={sorted(STAGE1_EXCLUDED_TYPE_CODES)}")
+
 def read_tsv(path: Path):
     text = path.read_text(encoding="utf-8-sig")
     newline = "\r\n" if ("\r\n" in text and text.count("\r\n") >= text.count("\n")/2) else "\n"
@@ -1725,71 +1754,38 @@ def apply_tc_enrichment_highlevel_bases(mod_root: Path, report: list[str], enabl
         t2 = (br.get(col_type2) or "").strip()
         return (t1 in restricted_type_codes) or (t2 in restricted_type_codes)
 
-    # Collect eligible base codes from Classic-enabled uniques (exclude ass/dru locked bases)
-    ver_key = find_column_by_name(uh, "version")
-    code_key = find_column_by_name(uh, "code")
-    en_key = next((k for k in uh if normalize_column_key(k) in ("enabled","enabled1")), None)
-
-    if not ver_key or not code_key:
-        report.append("[tc-enrichment] uniqueitems missing version/code; skipped")
-        return
+    # Collect eligible base codes from base tables directly (gated variety):
+    # A base is eligible if its type/type2 is in the stable allowlist, even if it has no unique/set mapping.
+    _validate_stage1_type_lists(report)
+    stable_type_codes = STAGE1_STABLE_TYPE_CODES
+    excluded_type_codes = STAGE1_EXCLUDED_TYPE_CODES
+    banned_misc_types = BANNED_MISC_TYPES
 
     eligible = []
     seen = set()
-    for r in urows:
-        v = (r.get(ver_key) or "").strip()
-        if v not in ("", "0"):
-            continue
-        if en_key:
-            ev = (r.get(en_key) or "").strip()
-            if ev not in ("", "1"):
+    for tname, (p_b, h_b, rows_b, col_code_b, col_ver_b, col_spawn_b, col_type_b, col_type2_b) in base_tables.items():
+        for br in rows_b:
+            c = (br.get(col_code_b) or "").strip().lower()
+            if not c or c in seen:
                 continue
-        c = (r.get(code_key) or "").strip().lower()
-        if not c or c in seen:
-            continue
-        if is_restricted_base(c):
-            continue
-        seen.add(c)
-        eligible.append(c)
+            t1 = (br.get(col_type_b) or "").strip().lower() if col_type_b else ""
+            t2 = (br.get(col_type2_b) or "").strip().lower() if col_type2_b else ""
+            if t1 in banned_misc_types or t2 in banned_misc_types:
+                continue
+            if t1 in excluded_type_codes or t2 in excluded_type_codes:
+                continue
+            if (t1 not in stable_type_codes) and (t2 not in stable_type_codes):
+                continue
+            if is_restricted_base(c):
+                continue
+            seen.add(c)
+            eligible.append(c)
 
     if not eligible:
         report.append("[tc-enrichment] No eligible base codes found; skipped")
         return
 
-    # Exclude classic-unsafe misc categories even if Classic-enabled (e.g., unique jewel rows).
-    banned_misc_types = {"jewl", "jewel", "charm", "rune"}
-
-    # Stage-1 stable Classic port allowlist:
-    # Only port expansion uniques/sets whose *base item type* is known stable under the harness.
-    # Explicitly exclude problematic categories (jave, thro) and non-ports (hamm, club) plus gems/jewels/runes/charms.
-    stable_type_codes = {
-        "tors","helm","glov","boot","belt","shie","head",
-        "swor","axe","mace","wand","scep","staf","spea","knif","pole",
-        "bow","xbow","orb","ring","amul",
-    }
-    excluded_type_codes = {"jave","thro","hamm","club","jewl","rune","scha","mcha","lcha","gcha"}
-    before_unsafe = len(eligible)
-    eligible2 = []
-    for c in eligible:
-        if is_restricted_base(c):
-            continue
-        bi = base_index.get(c)
-        if not bi:
-            continue
-        tname, ridx = bi
-        _p, _h, rows_b, _col_code, col_type, col_type2 = base_tables[tname]
-        br = rows_b[ridx]
-        t1 = (br.get(col_type) or "").strip().lower() if col_type else ""
-        t2 = (br.get(col_type2) or "").strip().lower() if col_type2 else ""
-        if t1 in banned_misc_types or t2 in banned_misc_types:
-            continue
-        eligible2.append(c)
-    eligible = eligible2
-    removed_unsafe = before_unsafe - len(eligible)
-    if removed_unsafe:
-        report.append(f"[tc-enrichment] filtered {removed_unsafe} classic-unsafe base code(s) by type (banned={sorted(banned_misc_types)})")
-
-    # Deterministic shuffle
+# Deterministic shuffle
     rng = random.Random(20260221)
     eligible_sorted = sorted(eligible)
     rng.shuffle(eligible_sorted)
@@ -2140,11 +2136,9 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
         tcode = (r.get(col_type_code) or "").strip()
         if tcode and cls in ("ass", "dru"):
             restricted_type_codes.add(tcode)
-
     # Exclude known-problematic/unsupported type groups from the Classic LoD port layer
     # (engine/inventory issues or deliberately excluded from the harness/port plan)
-    excluded_type_codes = set(["jave", "thro", "jewl", "rune", "scha", "mcha", "lcha", "gcha"]) 
-
+    # NOTE: single-source-of-truth lists are defined at module scope.
     # --- load base tables ---
     base_tables = {}
     base_index = {}  # code -> (table_key, row_idx)
@@ -2231,10 +2225,8 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
     skipped_by_prop = []  # list[(unique_index, token)]
     missing_bases = set()
     touched_base_codes = set()
-
     # Exclude expansion-only misc categories in Classic (even if a unique exists): jewels, charms, runes.
-    banned_misc_types = {"jewl", "jewel", "charm", "rune"}
-
+    banned_misc_types = BANNED_MISC_TYPES
     for r in rows_u:
         idx = (r.get(col_u_idx) or "").strip()
         code_item = (r.get(col_u_code) or "").strip()
@@ -2378,6 +2370,39 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
         if changed:
             enabled_bases += 1
 
+    # Additionally, enable ALL bases whose itemtype is in the stable allowlist, even if they do not
+    # currently have a unique/set mapping. This preserves gated variety while keeping the eligibility
+    # contract consistent with the harness-validated stable set.
+    for fname, (p, h, rows, col_code, col_ver, col_spawn, col_type, col_type2) in base_tables.items():
+        for br in rows:
+            c = (br.get(col_code) or "").strip()
+            if not c:
+                continue
+            t1 = (br.get(col_type) or "").strip().lower() if col_type else ""
+            t2 = (br.get(col_type2) or "").strip().lower() if col_type2 else ""
+            # Exclude banned misc types outright
+            if t1 in banned_misc_types or t2 in banned_misc_types:
+                continue
+            # Skip excluded/problematic families
+            if t1 in excluded_type_codes or t2 in excluded_type_codes:
+                continue
+            # Must match stable allowlist on either type slot
+            if (t1 not in stable_type_codes) and (t2 not in stable_type_codes):
+                continue
+            # Skip ass/dru class-locked bases
+            if is_restricted_base(c):
+                continue
+            changed = False
+            if (br.get(col_ver) or "").strip() != "0":
+                br[col_ver] = "0"
+                changed = True
+            if col_spawn:
+                if (br.get(col_spawn) or "").strip() != "1":
+                    br[col_spawn] = "1"
+                    changed = True
+            if changed:
+                enabled_bases += 1
+
     # write base tables back
     for fname, (p, h, rows, col_code, col_ver, col_spawn, col_type, col_type2) in base_tables.items():
         write_tsv(p, h, rows)
@@ -2455,9 +2480,16 @@ def apply_stage1_cow_harness(mod_root: Path, vanilla_root: Path, report: list[st
     excel_van = vanilla_root / "data/global/excel"
     p_tc   = excel_mod / "treasureclassex.txt"
     p_mon  = excel_mod / "monstats.txt"
+    # Primary pool source: vanilla tables (as extracted).
+    # Fallback pool source: *mod* tables, filtered to Classic (version==0), so Stage-1
+    # always has a sane Classic-only pool even when the expansion/port layer has no
+    # matching candidates for a given type (e.g. some LoD-only unique base coverage).
     p_arm  = excel_van / "armor.txt"
     p_weap = excel_van / "weapons.txt"
     p_misc = excel_van / "misc.txt"
+    p_arm_mod  = excel_mod / "armor.txt"
+    p_weap_mod = excel_mod / "weapons.txt"
+    p_misc_mod = excel_mod / "misc.txt"
     if not p_tc.exists():
         report.append("[stage1-cow] Missing treasureclassex.txt; skipped")
         return
@@ -2481,7 +2513,7 @@ def apply_stage1_cow_harness(mod_root: Path, vanilla_root: Path, report: list[st
         report.append("[stage1-cow] treasureclassex header missing expected columns; skipped")
         return
 
-    def load_pool_from_table(path: Path, want_type: str) -> list[str]:
+    def load_pool_from_table(path: Path, want_type: str, *, classic_only: bool = False) -> list[str]:
         if not path.exists():
             return []
         h, rows, _ = read_tsv(path)
@@ -2489,9 +2521,15 @@ def apply_stage1_cow_harness(mod_root: Path, vanilla_root: Path, report: list[st
         type_col = find_column_by_name(h, "type") or "type"
         class_col = find_column_by_name(h, "class") or "class"
         spawn_col = find_column_by_name(h, "spawnable") or "spawnable"
+        ver_col = find_column_by_name(h, "version") or "version"
 
         out_codes = []
         for r in rows:
+            if classic_only and ver_col in h:
+                v = (r.get(ver_col) or "").strip()
+                # Classic bases are version==0; expansion bases are usually 100.
+                if v not in ("0", ""):
+                    continue
             code = (r.get(code_col) or "").strip()
             if not code:
                 continue
@@ -2519,15 +2557,30 @@ def apply_stage1_cow_harness(mod_root: Path, vanilla_root: Path, report: list[st
             uniq.append(c)
         return sorted(uniq, key=lambda s: s.lower())
 
-    if preset in ("TORS","HELM","GLOV","BOOT","BELT","SHLD","HEAD"):
+    is_armor = preset in ("TORS","HELM","GLOV","BOOT","BELT","SHLD","HEAD")
+    is_weap  = preset in ("SWOR","AXE","MACE","HAMM","CLUB","WAND","SCEP","STAF","SPEA","JAVE","DAGG","POLE","THRO","BOW","XBOW","ORB")
+
+    # Primary pool from vanilla tables
+    if is_armor:
         pool = load_pool_from_table(p_arm, want_type)
-    elif preset in ("SWOR","AXE","MACE","WAND","SCEP","STAF","SPEA","JAVE","DAGG","POLE","THRO","BOW","XBOW","ORB"):
+    elif is_weap:
         pool = load_pool_from_table(p_weap, want_type)
     else:
         pool = load_pool_from_table(p_misc, want_type)
 
+    # Fallback pool from *mod* tables, Classic-only (version==0)
     if not pool:
-        report.append(f"[stage1-cow] Preset {preset}: no base codes found (after filters); skipped")
+        if is_armor:
+            pool = load_pool_from_table(p_arm_mod, want_type, classic_only=True)
+        elif is_weap:
+            pool = load_pool_from_table(p_weap_mod, want_type, classic_only=True)
+        else:
+            pool = load_pool_from_table(p_misc_mod, want_type, classic_only=True)
+        if pool:
+            report.append(f"[stage1-cow] Preset {preset}: primary pool empty; using Classic-only fallback pool (n={len(pool)})")
+
+    if not pool:
+        report.append(f"[stage1-cow] Preset {preset}: no base codes found (after filters + Classic fallback); skipped")
         return
 
     main_tc = f"zz_stage1_cow_{preset}"
