@@ -1,4 +1,4 @@
-# D2R Classic++ Forge & Port Patcher (Canonical R127)
+# D2R Classic++ Forge & Port Patcher (R127)
 
 ## Target Game Version (Hard-Pinned)
 
@@ -10,17 +10,6 @@ Scope: Classic only. Expansion content may be safely ported into Classic via thi
 
 ---
 
-# Canonical Baseline
-
-This build is locked to:
-
-PatcherR127_RETHINK_CUBESETLVLREQ
-
-All prior patch numbers and legacy changelog sections are deprecated.
-Future modifications must increment revision >= R128.
-
----
-
 # Stage0 — Always On (QoL Baseline)
 
 Stage0 is unconditional and independent of drop stages.
@@ -28,13 +17,13 @@ Stage0 is unconditional and independent of drop stages.
 Includes:
 
 - Deterministic cube forge injection (schema-robust, header-normalized)
-- Andariel quest-drop fix
+- Andariel always quest-drop fixed (Preserving Classic Bug)
 - TOA version=0 safeguard
 - Stack adjustments (Classic):
-  - Keys: 50
-  - Tome of Town Portal: 80
-  - Tome of Identify: 80
-  - Arrows/Bolts unchanged (500)
+  - Keys: 100
+  - Tome of Town Portal: 100
+  - Tome of Identify: 100
+  - Arrows/Bolts: 999
 - ShowLevel=1 for armor/weapons
 - InTown skill overrides
 - Relaxed base requirements (armor/weapons)
@@ -103,6 +92,15 @@ Runs after port layer:
 
 # How To Run
 
+Pre-requisite:
+Original TXT database dump from your version of the game (version agnostic).
+
+Quick build:
+
+run patch.bat
+
+Slightly not so quick build:
+
 Standard build:
 
 python patcher.py --vanilla "C:\vanilla" --out "C:\output"
@@ -119,4 +117,4 @@ python patcher.py --vanilla "C:\vanilla" --out "C:\output" --enable-expansion-dr
 
 ---
 
-End of canonical documentation.
+End of documentation.
