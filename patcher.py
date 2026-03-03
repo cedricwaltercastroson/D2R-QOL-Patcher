@@ -2960,14 +2960,14 @@ def apply_stage5_stash_lodish(mod_root: Path, vanilla_root: Path, report: list[s
                     children[j] = cc
                     return
 
-        if orig_name.endswith("layouthd.json"):
-            _set_rect("gold_amount", {"x": 482, "y": 1305})
-            _set_rect("gold_withdraw", {"x": 427, "y": 1304})
-        else:
-            _set_rect("gold_max", {"x": 78, "y": 35})
-            _set_rect("gold_amount", {"x": 40, "y": 358})
-            _set_rect("gold_withdraw", {"x": 15, "y": 357})
-            _set_rect("close", {"x": 272, "y": 384})
+#        if orig_name.endswith("layouthd.json"):
+#            _set_rect("gold_amount", {"x": 482, "y": 1305})
+#            _set_rect("gold_withdraw", {"x": 427, "y": 1304})
+#        else:
+#            _set_rect("gold_max", {"x": 78, "y": 35})
+#            _set_rect("gold_amount", {"x": 40, "y": 358})
+#            _set_rect("gold_withdraw", {"x": 15, "y": 357})
+#            _set_rect("close", {"x": 272, "y": 384})
 
         # Safe initial implementation: no tabs
         children = [c for c in children if c.get("name") not in ("BankTabs", "PreviousSeasonToggleDisplay", "PreviousLadderSeasonBankTabs")]
@@ -2996,7 +2996,80 @@ def apply_stage5_stash_lodish(mod_root: Path, vanilla_root: Path, report: list[s
     else:
         report.append("[stage5-stash] inventory.txt: SKIP (output inventory.txt not found)")
 
-    report.append(f"[stage5-stash] APPLIED: generated bankoriginallayout(.hd).json from vanilla bankexpansion deltas (files={generated})")
+    
+    # ---- Controller layouts (HD-only in some vanilla dumps) ----
+    controller_generated = 0
+    v_ctl_dir = vanilla_root / "data" / "global" / "ui" / "layouts" / "controller"
+    if v_ctl_dir.exists():
+        ctl_pairs = [
+            ("bankoriginallayouthd.json", "bankexpansionlayouthd.json"),
+            # non-HD controller layouts often don't exist; only generate if present
+            ("bankoriginallayout.json", "bankexpansionlayout.json"),
+        ]
+        out_ctl_dir = out_layout_dir / "controller"
+        out_ctl_dir.mkdir(parents=True, exist_ok=True)
+
+        for orig_name, exp_name in ctl_pairs:
+            orig_path = v_ctl_dir / orig_name
+            exp_path = v_ctl_dir / exp_name
+            if not orig_path.exists() or not exp_path.exists():
+                continue
+
+            orig = _load_relaxed_json(orig_path)
+            exp = _load_relaxed_json(exp_path)
+
+            # Standalone (no inheritance)
+            orig.pop("basedOn", None)
+
+            children = list(orig.get("children", []))
+
+            # Background filename from expansion if present
+            bg_exp = _find_child(exp.get("children", []), "background")
+            for i, c in enumerate(children):
+                if c.get("name") == "background":
+                    cc = dict(c)
+                    fields = dict(cc.get("fields", {}))
+                    if bg_exp and "fields" in bg_exp and "filename" in bg_exp["fields"]:
+                        fields["filename"] = bg_exp["fields"]["filename"]
+                    cc["fields"] = fields
+                    children[i] = cc
+                    break
+
+            # Grid: rect + 10x10 cellCount from expansion
+            grid_exp = _find_child(exp.get("children", []), "grid")
+            for i, c in enumerate(children):
+                if c.get("name") == "grid":
+                    cc = dict(c)
+                    fields = dict(cc.get("fields", {}))
+                    if grid_exp and "fields" in grid_exp:
+                        expf = grid_exp["fields"]
+                        if "rect" in expf:
+                            fields["rect"] = expf["rect"]
+                        if "cellCount" in expf:
+                            fields["cellCount"] = expf["cellCount"]
+                    # ensure 10x10 at minimum
+                    fields.setdefault("cellCount", {"x": 10, "y": 10})
+                    fields.setdefault("cellSize", "$ItemCellSize")
+                    cc["fields"] = fields
+                    children[i] = cc
+                    break
+
+            # Remove tab widgets for stability (Stage 5/5.1 policy)
+            children = [c for c in children if c.get("name") not in ("BankTabs", "PreviousSeasonToggleDisplay", "PreviousLadderSeasonBankTabs")]
+            orig["children"] = children
+
+            (out_ctl_dir / orig_name).write_text(json.dumps(orig, indent=4), encoding="utf-8", newline="\n")
+            controller_generated += 1
+
+        if controller_generated > 0:
+            report.append(f"[stage5-stash-controller] APPLIED: generated controller bank layouts (files={controller_generated})")
+        else:
+            # Not an error: many vanilla dumps ship controller stash as HD-only, or not at all in extracted trees.
+            report.append("[stage5-stash-controller] SKIP: no controller bank layout pairs present in vanilla")
+    else:
+        report.append("[stage5-stash-controller] SKIP: vanilla layouts/controller folder not present")
+
+    report.append(f"[stage5-stash] APPLIED: generated bankoriginallayout(.hd).json from vanilla bankexpansion deltas (files={generated}, controller_files={controller_generated})")
 
 
 def main():
