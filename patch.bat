@@ -12,6 +12,7 @@ REM   patch.bat stage2       -> EXP ladder stage 2 (port + cow sampling)
 REM   patch.bat stage3       -> EXP ladder stage 3 (port + cow + tc-enrich diagnostic)
 REM   patch.bat stage4       -> EXP ladder stage 4 (stage3 + chaos)
 REM   patch.bat ui           -> Stage 0 baseline + UI overrides
+REM   patch.bat stage5       -> Stage 5 large stash generator (UI-only)
 REM
 
 setlocal EnableExtensions EnableDelayedExpansion
@@ -39,6 +40,7 @@ set COWALLBASES=1
 set COWCHAOS=1
 set EXP_DROPS_STAGE=4
 set UITOGGLE=0
+set LODSTASH=1
 
 REM =========================================================
 REM  Stage-1 Cow Harness Toggles (process-of-elimination)
@@ -102,11 +104,13 @@ if /I "%MODE%"=="stage0" (
     set COWCHAOS=1
 ) else if /I "%MODE%"=="ui" (
     set UITOGGLE=1
+) else if /I "%MODE%"=="stage5" (
+    set LODSTASH=1
 ) else (
     echo.
     echo Unknown mode: "%MODE%"
     echo.
-    echo Valid modes: stage0, stage1, stage2, stage3, stage4, ui
+    echo Valid modes: stage0, stage1, stage2, stage3, stage4, ui, stage5
     echo.
     pause
     exit /b 1
@@ -131,6 +135,10 @@ if "%UITOGGLE%"=="1" (
     set CMD=%CMD% --enable-ui
 )
 
+if "%LODSTASH%"=="1" (
+    set CMD=%CMD% --stash-lodish
+)
+
 echo.
 echo =========================================================
 echo Mode: %MODE%
@@ -139,6 +147,7 @@ echo EXP_DROPS_STAGE=%EXP_DROPS_STAGE%
 echo COWALLBASES=%COWALLBASES%
 echo COWCHAOS=%COWCHAOS%
 echo UITOGGLE=%UITOGGLE%
+echo LODSTASH=%LODSTASH%
 echo VANILLA_ROOT=%VANILLA_ROOT%
 echo OUT_ROOT=%OUT_ROOT%
 echo =========================================================

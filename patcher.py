@@ -2869,6 +2869,136 @@ def guard_no_gameplay_txt_in_static_mod(static_root: Path) -> None:
         )
 
 
+# === Stage 5: LoD-style large stash for Classic (generator, vanilla-derived) ===
+
+def _load_relaxed_json(path: Path) -> dict:
+    """Load JSON with tolerance for trailing commas."""
+    s = path.read_text(encoding="utf-8", errors="strict")
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    return json.loads(s)
+
+def _find_child(children: list[dict], name: str) -> dict | None:
+    for c in children:
+        if c.get("name") == name:
+            return c
+    return None
+
+def apply_stage5_stash_lodish(mod_root: Path, vanilla_root: Path, report: list[str]) -> None:
+    """
+    Stage 5 (additive): port LoD stash geometry into Classic safely.
+
+    - Generates standalone Classic bankoriginal layouts from vanilla bankexpansion deltas (normal + HD)
+    - Patches inventory.txt bank backing store so stash grid size matches UI (Bank Page 1 -> Big Bank Page 1)
+    """
+    # ---- Layout JSON merge ----
+    v_layout_dir = vanilla_root / "data" / "global" / "ui" / "layouts"
+    src_pairs = [
+        ("bankoriginallayout.json", "bankexpansionlayout.json"),
+        ("bankoriginallayouthd.json", "bankexpansionlayouthd.json"),
+    ]
+
+    out_layout_dir = mod_root / "data" / "global" / "ui" / "layouts"
+    out_layout_dir.mkdir(parents=True, exist_ok=True)
+
+    generated = 0
+    for orig_name, exp_name in src_pairs:
+        orig_path = v_layout_dir / orig_name
+        exp_path = v_layout_dir / exp_name
+        if not orig_path.exists() or not exp_path.exists():
+            report.append(f"[stage5-stash] SKIP: missing vanilla layout(s): {orig_name if not orig_path.exists() else ''} {exp_name if not exp_path.exists() else ''}".strip())
+            continue
+
+        orig = _load_relaxed_json(orig_path)
+        exp = _load_relaxed_json(exp_path)
+
+        # Make standalone
+        orig.pop("basedOn", None)
+
+        children = list(orig.get("children", []))
+
+        # Background filename from expansion
+        bg_exp = _find_child(exp.get("children", []), "background")
+        if bg_exp and "fields" in bg_exp and "filename" in bg_exp["fields"]:
+            for i, c in enumerate(children):
+                if c.get("name") == "background":
+                    cc = dict(c)
+                    fields = dict(cc.get("fields", {}))
+                    fields["filename"] = bg_exp["fields"]["filename"]
+                    cc["fields"] = fields
+                    children[i] = cc
+                    break
+
+        # Grid rect + cellCount from expansion
+        grid_exp = _find_child(exp.get("children", []), "grid")
+        if grid_exp and "fields" in grid_exp:
+            expf = grid_exp["fields"]
+        else:
+            expf = {}
+
+        for i, c in enumerate(children):
+            if c.get("name") == "grid":
+                cc = dict(c)
+                fields = dict(cc.get("fields", {}))
+                if "rect" in expf:
+                    fields["rect"] = expf["rect"]
+                if "cellCount" in expf:
+                    fields["cellCount"] = expf["cellCount"]
+                else:
+                    fields["cellCount"] = {"x": "10", "y": "10"}
+                cc["fields"] = fields
+                children[i] = cc
+                break
+
+        # Nudge rects to expansion-friendly positions (safe no-op if missing)
+        def _set_rect(child_name: str, rect: dict):
+            for j, c0 in enumerate(children):
+                if c0.get("name") == child_name:
+                    cc = dict(c0)
+                    f = dict(cc.get("fields", {}))
+                    f["rect"] = rect
+                    cc["fields"] = f
+                    children[j] = cc
+                    return
+
+        if orig_name.endswith("layouthd.json"):
+            _set_rect("gold_amount", {"x": 482, "y": 1305})
+            _set_rect("gold_withdraw", {"x": 427, "y": 1304})
+        else:
+            _set_rect("gold_max", {"x": 78, "y": 35})
+            _set_rect("gold_amount", {"x": 40, "y": 358})
+            _set_rect("gold_withdraw", {"x": 15, "y": 357})
+            _set_rect("close", {"x": 272, "y": 384})
+
+        # Safe initial implementation: no tabs
+        children = [c for c in children if c.get("name") not in ("BankTabs", "PreviousSeasonToggleDisplay", "PreviousLadderSeasonBankTabs")]
+        orig["children"] = children
+
+        out_path = out_layout_dir / orig_name
+        out_path.write_text(json.dumps(orig, indent=4), encoding="utf-8")
+        generated += 1
+
+    # ---- Inventory bank backing store patch ----
+    out_inv = mod_root / "data" / "global" / "excel" / "inventory.txt"
+    if out_inv.exists():
+        header, rows, newline = read_tsv(out_inv)
+        idx = {r.get("class", ""): r for r in rows}
+        src = idx.get("Big Bank Page 1")
+        dst = idx.get("Bank Page 1")
+        if src and dst:
+            for k in header:
+                if k == "class":
+                    continue
+                dst[k] = src.get(k, dst.get(k, ""))
+            write_tsv(out_inv, header, rows, newline=newline)
+            report.append("[stage5-stash] inventory.txt: patched 'Bank Page 1' to match 'Big Bank Page 1' (10x10)")
+        else:
+            report.append("[stage5-stash] inventory.txt: SKIP (missing Bank Page 1 or Big Bank Page 1)")
+    else:
+        report.append("[stage5-stash] inventory.txt: SKIP (output inventory.txt not found)")
+
+    report.append(f"[stage5-stash] APPLIED: generated bankoriginallayout(.hd).json from vanilla bankexpansion deltas (files={generated})")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vanilla", required=True, help="Path to vanilla dump root containing data/ ...")
@@ -2883,6 +3013,7 @@ def main():
         help="Enable Expansion (LoD) base items to drop naturally in Classic via TreasureClassEx integration (safe: fills empty slots only; no NoDrop/Picks changes).",
     )
     ap.add_argument("--enable-ui", action="store_true", help="Enable UI layout json overrides (default is disabled: files are renamed to disable*).")
+    ap.add_argument("--stash-lodish", action="store_true", help="Stage 5: Generate LoD-style large stash for Classic (bankoriginal layouts + inventory bank grid).")
     ap.add_argument("--patch-sources", default=str(Path(__file__).parent/"patch_sources"),
                     help="Folder containing cubemain.txt and UI json overrides")
     args = ap.parse_args()
@@ -3007,6 +3138,9 @@ def main():
     apply_stage1_cow_harness(mod_root, vanilla_root, report, stage1_preset)
 
     # 4) Write run log
+    if getattr(args, "stash_lodish", False):
+        apply_stage5_stash_lodish(mod_root, vanilla_root, report)
+
     (out/"log.txt").write_text("\n".join(report), encoding="utf-8")
     print("Patched mod tree written to:", out)
     print("Log:", out/"log.txt")
