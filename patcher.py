@@ -2960,14 +2960,7 @@ def apply_stage5_stash_lodish(mod_root: Path, vanilla_root: Path, report: list[s
                     children[j] = cc
                     return
 
-#        if orig_name.endswith("layouthd.json"):
-#            _set_rect("gold_amount", {"x": 482, "y": 1305})
-#            _set_rect("gold_withdraw", {"x": 427, "y": 1304})
-#        else:
-#            _set_rect("gold_max", {"x": 78, "y": 35})
-#            _set_rect("gold_amount", {"x": 40, "y": 358})
-#            _set_rect("gold_withdraw", {"x": 15, "y": 357})
-#            _set_rect("close", {"x": 272, "y": 384})
+        # Gold widget rects inherited from Original bank layout (no hard-pin)
 
         # Safe initial implementation: no tabs
         children = [c for c in children if c.get("name") not in ("BankTabs", "PreviousSeasonToggleDisplay", "PreviousLadderSeasonBankTabs")]
