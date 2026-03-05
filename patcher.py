@@ -1741,6 +1741,164 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
     report.append(f"[cow-all-bases] Wrappers: N={wrap_N} NM={wrap_NM} H={wrap_H}")
 
 
+
+def apply_no_low_quality_items(mod_root, report, enabled: bool):
+    """Stage 0 (optional): Disable low-quality (cracked/crude/damaged) item drops.
+
+    Implementation: patch data/global/excel/itemratio.txt so Normal is forced to 1 and NormalDivisor to 1024
+    (and NormalMin if present). Since low quality is the fallback when all other quality checks fail,
+    forcing the Normal check to effectively always succeed ensures the engine falls back to Normal instead of Low Quality (including cases where monster level is below base qlvl).
+
+    This is table-only and save-safe.
+    """
+    if not enabled:
+        report.append("[stage0-itemratio] Disabled (flag off); skipped")
+        return
+
+    p = mod_root / "data/global/excel/itemratio.txt"
+    if not p.exists():
+        report.append("[stage0-itemratio] Missing itemratio.txt; skipped")
+        return
+
+    import csv
+
+    lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+    if not lines:
+        report.append("[stage0-itemratio] itemratio.txt empty; skipped")
+        return
+
+    try:
+        rows = list(csv.reader(lines, delimiter="\t"))
+        header = rows[0]
+        # Find columns (D2R typically has Normal + NormalDivisor; some schemas also have NormalMin)
+        def col(name: str):
+            name = name.strip().lower()
+            for i, h in enumerate(header):
+                if h.strip().lower() == name:
+                    return i
+            return None
+
+        c_normal = col("Normal")
+        c_normaldiv = col("NormalDivisor")
+        c_normalmin = col("NormalMin")
+
+        if c_normal is None or c_normaldiv is None:
+            report.append("[stage0-itemratio] itemratio missing Normal/NormalDivisor columns; skipped")
+            return
+
+        patched = 0
+        for r in rows[1:]:
+            if len(r) < len(header):
+                r.extend([""] * (len(header) - len(r)))
+            if not r or not r[0].strip():
+                continue
+            changed = False
+            if r[c_normal] != "1":
+                r[c_normal] = "1"
+                changed = True
+            if r[c_normaldiv] != "1024":
+                r[c_normaldiv] = "1024"
+                changed = True
+            if c_normalmin is not None and r[c_normalmin] != "1":
+                r[c_normalmin] = "1"
+                changed = True
+            if changed:
+                patched += 1
+
+        out = ["\t".join(r) for r in rows]
+        p.write_text("\n".join(out) + "\n", encoding="utf-8")
+        report.append(f"[stage0-itemratio] NOLOWQUALITY_V4 NormalDivisor=1024 patched_rows={patched}")
+    except Exception as e:
+        report.append(f"[stage0-itemratio] ERROR while patching itemratio: {e}")
+        # Do not raise; keep patcher stable.
+        return
+
+
+def apply_cow_always_drop(mod_root: Path, report: list[str], enabled: bool) -> None:
+    """Stage-4 cow tweak: ensure each Hell Bovine (and optionally Cow King) kill yields at least one TC pick.
+
+    Implementation (Approach B):
+      - Reads monstats.txt to find the TreasureClass rows used by 'hellbovine' and 'cowking' (all difficulties).
+      - Patches TreasureClassEx.txt for those TC names: set NoDrop=0; ensure Picks>=1.
+    This is intentionally narrow to avoid affecting other monsters/TCs.
+    """
+    if not enabled:
+        report.append("[stage4-cow] Disabled (flag off); skipped")
+        return
+
+    excel = mod_root / "data/global/excel"
+    p_ms = excel / "monstats.txt"
+    p_tc = excel / "TreasureClassEx.txt"
+    if not p_ms.exists() or not p_tc.exists():
+        report.append("[stage4-cow] Missing monstats.txt or TreasureClassEx.txt; skipped")
+        return
+
+    th_ms, ms_rows, ms_nl = read_tsv(p_ms)
+    # Identify columns
+    def _norm(s: str) -> str:
+        return (s or "").strip().lstrip("\ufeff").lower().replace(" ", "")
+    col_id = next((c for c in th_ms if _norm(c) in ("id","name","monstats","monstat")), None)
+    # In D2R tables, it is typically 'Id'
+    if col_id is None:
+        col_id = next((c for c in th_ms if _norm(c) == "id"), None)
+
+    tc_cols = [c for c in th_ms if _norm(c).startswith("treasureclass")]
+    if col_id is None or not tc_cols:
+        report.append("[stage4-cow] Could not locate Id/TreasureClass columns in monstats.txt; skipped")
+        return
+
+    targets = {"hellbovine", "cowking"}
+    tc_names = set()
+    for r in ms_rows:
+        mid = (r.get(col_id) or "").strip().lower()
+        if mid in targets:
+            for c in tc_cols:
+                v = (r.get(c) or "").strip()
+                if v:
+                    tc_names.add(v)
+
+    if not tc_names:
+        report.append("[stage4-cow] No cow TC names discovered from monstats (hellbovine/cowking); skipped")
+        return
+
+    th_tc, tc_rows, tc_nl = read_tsv(p_tc)
+    col_tc = next((c for c in th_tc if _norm(c) in ("treasureclass","treasureclass1","treasureclassname")), None)
+    if col_tc is None:
+        # In D2R it's usually 'Treasure Class'
+        col_tc = next((c for c in th_tc if "treasure" in _norm(c) and "class" in _norm(c)), None)
+    col_nodrop = next((c for c in th_tc if _norm(c) == "nodrop"), None)
+    col_picks = next((c for c in th_tc if _norm(c) == "picks"), None)
+
+    if col_tc is None or col_nodrop is None:
+        report.append("[stage4-cow] Could not locate TreasureClass/NoDrop columns in TreasureClassEx.txt; skipped")
+        return
+
+    patched = 0
+    for r in tc_rows:
+        name = (r.get(col_tc) or "").strip()
+        if name and name in tc_names:
+            old_nd = (r.get(col_nodrop) or "").strip()
+            if old_nd != "0":
+                r[col_nodrop] = "0"
+            # Ensure picks >= 1 if the column exists
+            if col_picks is not None:
+                try:
+                    p = int((r.get(col_picks) or "0").strip() or "0")
+                except Exception:
+                    p = 0
+                if p <= 0:
+                    r[col_picks] = "1"
+            patched += 1
+            report.append(f"[stage4-cow] force drop: TC={name} NoDrop {old_nd or '(blank)'}->0" + (f" Picks={r.get(col_picks)}" if col_picks else ""))
+
+    if patched == 0:
+        report.append("[stage4-cow] No matching TC rows found to patch (unexpected); skipped")
+        return
+
+    write_tsv(p_tc, th_tc, tc_rows, newline=tc_nl)
+    report.append(f"[stage4-cow] Patched {patched} cow TreasureClassEx row(s) (NoDrop=0)")
+
+
 def apply_tc_enrichment_highlevel_bases(mod_root: Path, report: list[str], enabled: bool) -> None:
     """TC enrichment layer (drops): integrate ported (non-Assassin/Druid) bases into natural TreasureClassEx drops.
 
@@ -2313,7 +2471,8 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
     #   18-20 = Assassin (Traps / Martial Arts / Shadow Disciplines)
     # We exclude these so LoD-class tab-skill uniques (e.g., Earthshaker's +Elemental)
     # do NOT get ported/enabled in Classic++ until Phase 2.
-    excluded_skilltab_ids = {"15", "16", "17", "18", "19", "20"}
+    excluded_skilltab_ids = {"15", "16", "17", "18", "19", "20", "21", "22"}
+    report.append("[classic-port] guard tag: ASSDRU_V2_SKILLTAB")
 
     def is_restricted_base(code: str) -> bool:
         rec = base_index.get(code)
@@ -2393,13 +2552,17 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
         if hit_token is None:
             for n, pc in prop_num_to_col.items():
                 tok = (r.get(pc) or "").strip().lower()
-                if tok != "item_addskilltab":
+                # Guard: block Assassin/Druid-specific uniques on any base
+                if tok in {"ass", "dru"}:
+                    hit_token = tok
+                    break
+                if tok not in {"item_addskilltab", "skilltab"}:
                     continue
                 parc = par_num_to_col.get(n)
                 parv = (r.get(parc) or "").strip() if parc else ""
                 if parv in excluded_skilltab_ids:
                     # Map to class for reporting only
-                    hit_token = "dru" if parv in {"15", "16", "17"} else "ass"
+                    hit_token = "dru" if parv in {"15", "16", "17", "18"} else "ass"
                     break
 
         if hit_token == "dru":
@@ -3071,6 +3234,8 @@ def main():
     ap.add_argument("--out", required=True, help="Output folder (a complete mod tree will be created here)")
     ap.add_argument("--cow-all-bases", action="store_true", help="Cow Level: integrate ALL base items with difficulty scaling (Normal/NM/Hell wrappers).")
     ap.add_argument("--cow-all-bases-full", action="store_true", help="Cow Level: FULL CHAOS mode (all bases equally likely regardless of difficulty). Implies --cow-all-bases.")
+    ap.add_argument("--no-low-quality", action="store_true", help="Stage 0: Disable low-quality (cracked/crude/damaged) item drops by forcing itemratio Normal=1 NormalDivisor=1 so the engine falls back to Normal instead of Low Quality.")
+    ap.add_argument("--cow-always-drop", action="store_true", help="Stage 4: Force Hell Bovines (and Cow King) to always drop at least one item by setting NoDrop=0 for the TreasureClass rows they use.")
     # Drop ecosystem integration (Expansion -> Classic).
     ap.add_argument(
         "--enable-expansion-drops-in-classic",
@@ -3171,8 +3336,22 @@ def main():
 
     apply_qol_baseline(mod_root, patch_sources, report)
 
+    # Stage 0 optional: disable low quality item drops (cracked/crude/damaged) by forcing Normal success in itemratio.
+    try:
+        apply_no_low_quality_items(mod_root, report, enabled=getattr(args, 'no_low_quality', False))
+    except Exception as e:
+        report.append(f"[stage0-itemratio] ERROR: {e}")
+
     # 3) Apply locked patches to the mod root (vanilla schema already seeded)
     patch_monstats_cow_xp_boost(mod_root, report, mult=9999)
+
+    # Stage 4 optional: force cows to always drop at least one item.
+    # Keep this extremely defensive: if a user's vanilla dump has unexpected TC naming/columns,
+    # we log and continue rather than crashing the patcher.
+    try:
+        apply_cow_always_drop(mod_root, report, enabled=getattr(args, 'cow_always_drop', False))
+    except Exception as e:
+        report.append(f"[stage4-cow] ERROR: {type(e).__name__}: {e}")
 
 
 

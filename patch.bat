@@ -43,6 +43,20 @@ set UITOGGLE=0
 set LODSTASH=1
 
 REM =========================================================
+REM  Stage-4 Cow Drop Override
+REM  0 = vanilla-ish (some cows can roll NoDrop)
+REM  1 = force cows to always drop at least one item (NoDrop=0)
+REM =========================================================
+set COWALWAYSDROP=1
+
+REM =========================================================
+REM  Stage-0 Low Quality Drop Disable
+REM  0 = allow low quality (cracked/crude/damaged) drops
+REM  1 = disable low quality drops (fallback becomes Normal quality)
+REM =========================================================
+set NOLOWQUALITY=1
+
+REM =========================================================
 REM  Stage-1 Cow Harness Toggles (process-of-elimination)
 REM  Set EXACTLY ONE of these to 1. Leave all 0 to disable.
 REM  (Read by patcher.py via env vars; no extra args needed)
@@ -139,6 +153,14 @@ if "%LODSTASH%"=="1" (
     set CMD=%CMD% --stash-lodish
 )
 
+if "%COWALWAYSDROP%"=="1" (
+    set CMD=%CMD% --cow-always-drop
+)
+
+if "%NOLOWQUALITY%"=="1" (
+    set CMD=%CMD% --no-low-quality
+)
+
 echo.
 echo =========================================================
 echo Mode: %MODE%
@@ -148,6 +170,7 @@ echo COWALLBASES=%COWALLBASES%
 echo COWCHAOS=%COWCHAOS%
 echo UITOGGLE=%UITOGGLE%
 echo LODSTASH=%LODSTASH%
+echo COWALWAYSDROP=%COWALWAYSDROP%
 echo VANILLA_ROOT=%VANILLA_ROOT%
 echo OUT_ROOT=%OUT_ROOT%
 echo =========================================================
