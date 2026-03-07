@@ -3165,6 +3165,46 @@ def apply_stage5_stash_lodish(mod_root: Path, vanilla_root: Path, report: list[s
         else:
             expf = {}
 
+        # Compute delta between original grid rect and expansion grid rect.
+        # We use this to keep certain UI widgets (gold/deposit/withdraw) aligned
+        # relative to the grid when porting expansion geometry.
+        def _rect_xy(rect: dict):
+            if not isinstance(rect, dict):
+                return None
+            for kx, ky in (("x", "y"), ("left", "top")):
+                if kx in rect and ky in rect:
+                    try:
+                        return int(float(rect[kx])), int(float(rect[ky]))
+                    except Exception:
+                        return None
+            return None
+
+        def _shift_rect(rect: dict, dx: int, dy: int) -> dict:
+            if not isinstance(rect, dict) or (dx == 0 and dy == 0):
+                return rect
+            r = dict(rect)
+            if "x" in r and "y" in r:
+                r["x"] = str(int(float(r["x"])) + dx)
+                r["y"] = str(int(float(r["y"])) + dy)
+            elif "left" in r and "top" in r:
+                r["left"] = str(int(float(r["left"])) + dx)
+                r["top"] = str(int(float(r["top"])) + dy)
+            return r
+
+        orig_grid_rect = None
+        for c in children:
+            if c.get("name") == "grid":
+                f0 = c.get("fields", {})
+                orig_grid_rect = f0.get("rect")
+                break
+        exp_grid_rect = expf.get("rect") if isinstance(expf, dict) else None
+        dxy = None
+        if orig_grid_rect is not None and exp_grid_rect is not None:
+            o = _rect_xy(orig_grid_rect)
+            e = _rect_xy(exp_grid_rect)
+            if o and e:
+                dxy = (e[0] - o[0], e[1] - o[1])
+
         for i, c in enumerate(children):
             if c.get("name") == "grid":
                 cc = dict(c)
@@ -3190,7 +3230,29 @@ def apply_stage5_stash_lodish(mod_root: Path, vanilla_root: Path, report: list[s
                     children[j] = cc
                     return
 
-        # Gold widget rects inherited from Original bank layout (no hard-pin)
+        # Keep explicit gold UI copying only for the SD/legacy-facing layout.
+        # HD/remastered should remain unpinned so the base layout keeps it flush.
+        if orig_name == "bankoriginallayout.json":
+            gold_like = {"gold_max", "gold_amount", "gold_withdraw", "gold_deposit"}
+            exp_children = {str(c.get("name", "")): c for c in exp.get("children", [])}
+            gold_copied = 0
+            for j, c0 in enumerate(children):
+                name = str(c0.get("name", ""))
+                if name not in gold_like:
+                    continue
+                src = exp_children.get(name)
+                if not src:
+                    continue
+                cc = dict(c0)
+                srcf = dict(src.get("fields", {}))
+                dstf = dict(cc.get("fields", {}))
+                if "rect" in srcf:
+                    dstf["rect"] = srcf["rect"]
+                    cc["fields"] = dstf
+                    children[j] = cc
+                    gold_copied += 1
+            if gold_copied:
+                report.append(f"[stage5-stash] gold-ui-sd: copied expansion positions for {gold_copied} widget(s) in {orig_name}")
 
         # Safe initial implementation: no tabs
         children = [c for c in children if c.get("name") not in ("BankTabs", "PreviousSeasonToggleDisplay", "PreviousLadderSeasonBankTabs")]
