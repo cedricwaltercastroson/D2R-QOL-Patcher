@@ -461,6 +461,73 @@ def patch_uniqueitems_force_max_rolls(mod_root: Path, report: list[str]) -> None
 
     report.append(f"[unique-maxrolls] forced max rolls (rows changed: {changed_rows}, cells: {changed_cells})")
 
+
+def verify_and_enforce_unique_max_rolls(mod_root: Path, report: list[str]) -> None:
+    """Final safety pass: verify Classic-enabled unique rows no longer contain ranged min/max values.
+    If any remain, force min=max again and report the exact residual count fixed.
+    """
+    p_uni = mod_root / "data/global/excel/uniqueitems.txt"
+    if not p_uni.exists():
+        report.append("[unique-maxrolls-verify] uniqueitems.txt not found; skipped")
+        return
+
+    hh, rows, _ = read_tsv(p_uni)
+
+    def nk(k: str) -> str:
+        return (k or "").strip().lower().replace(" ", "")
+
+    ver_k = next((k for k in hh if nk(k) == "version"), None)
+    min_cols = [c for c in hh if nk(c).startswith("min") and nk(c)[3:].isdigit()]
+    if not min_cols:
+        report.append("[unique-maxrolls-verify] no min/max columns found; skipped")
+        return
+
+    skip_props = {
+        "hit-skill", "gethit-skill", "kill-skill", "death-skill", "levelup-skill",
+        "att-skill", "strskill", "cast-skill", "charged",
+    }
+
+    fixed_rows = 0
+    fixed_cells = 0
+    remaining_rows = 0
+
+    for r in rows:
+        if ver_k:
+            vv = (r.get(ver_k) or "").strip().lower()
+            if vv and vv not in {"0", ""}:
+                continue
+
+        row_fixed = False
+        row_remaining = False
+        for c in min_cols:
+            try:
+                idx = int(re.sub(r"\D", "", c))
+            except Exception:
+                idx = None
+            prop = (r.get(f"prop{idx}") or "").strip().lower() if idx else ""
+            if prop in skip_props:
+                continue
+            mx = "max" + re.sub(r"^.*?(\d+)$", r"\1", c)
+            if mx not in hh:
+                continue
+            minv = (r.get(c) or "").strip()
+            maxv = (r.get(mx) or "").strip()
+            if not maxv:
+                continue
+            if minv != maxv:
+                r[c] = maxv
+                fixed_cells += 1
+                row_fixed = True
+                row_remaining = True
+        if row_fixed:
+            fixed_rows += 1
+        if row_remaining:
+            remaining_rows += 1
+
+    if fixed_cells:
+        write_tsv(p_uni, hh, rows)
+    report.append(f"[unique-maxrolls-verify] classic rows re-fixed: {fixed_rows}, cells: {fixed_cells}")
+
 def patch_setitems_force_max_rolls(mod_root: Path, report: list[str]) -> None:
     """Force maximum rolls for all ranged stats on setitems.txt (generic; no named special cases)."""
     rel = Path("data/global/excel/setitems.txt")
@@ -3370,6 +3437,7 @@ def main():
         report.append("[exp-drops] skipping LoD unique/set port layer")
     patch_relax_item_requirements(mod_root, report)
     patch_uniqueitems_force_max_rolls(mod_root, report)
+    verify_and_enforce_unique_max_rolls(mod_root, report)
 
 
     apply_remove_unique_level_requirements(mod_root, report)
