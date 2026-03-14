@@ -42,10 +42,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 STAGE1_STABLE_TYPE_CODES = {
     'tors','helm','glov','boot','belt','shie','head',
     'swor','axe','mace','wand','scep','staf','spea','knif','pole',
-    'bow','xbow','orb','ring','amul','hamm',
+    'bow','xbow','orb','ring','amul','hamm','jave',
 }
 # Categories we never port/enrich in Stage-1 (known-crashy or explicitly excluded pools)
-STAGE1_EXCLUDED_TYPE_CODES = {'jave','thro','club','jewl','rune','scha','mcha','lcha','gcha'}
+STAGE1_EXCLUDED_TYPE_CODES = {'thro','club','jewl','rune','scha','mcha','lcha','gcha'}
 
 
 def _validate_stage1_type_lists(report: list[str] | None = None) -> None:
@@ -2972,6 +2972,19 @@ def apply_stage1_cow_harness(mod_root: Path, vanilla_root: Path, report: list[st
 
     write_tsv(p_tc, th, tc_rows)
 
+    # Debug instrumentation: print exactly which treasureclassex.txt was written and whether
+    # the Stage-1 synthetic rows exist immediately after the save.
+    try:
+        _th_dbg, _rows_dbg, _ = read_tsv(p_tc)
+        _name_dbg = find_column_by_name(_th_dbg, "Treasure Class") or find_column_by_name(_th_dbg, "TreasureClass")
+        _have_dbg = set((r.get(_name_dbg) or "").strip() for r in _rows_dbg)
+        _dbg_need = [main_tc] + [f"{main_tc}_{i:02d}" for i in range(1, len(chunks)+1)]
+        _dbg_hits = [n for n in _dbg_need if n in _have_dbg]
+        report.append(f"[stage1-cow-path] treasureclassex_path={p_tc}")
+        report.append(f"[stage1-cow-path] synthetic_rows_present={len(_dbg_hits)}/{len(_dbg_need)} first={_dbg_hits[:5]}")
+    except Exception as e:
+        report.append(f"[stage1-cow-path] ERROR: {e}")
+
     # Patch monstats HellBovine + Cow King to point directly at our stage TCs for all variants
     mon_changed = 0
     if p_mon.exists():
@@ -2998,7 +3011,7 @@ def apply_stage1_cow_harness(mod_root: Path, vanilla_root: Path, report: list[st
         if mon_changed:
             write_tsv(p_mon, mh, mrows)
 
-    report.append(f"[stage1-cow] Enabled preset={preset} pool={len(pool)} chunks={len(chunks)} tc_overwrite_hits={changed} missing_TCs={len(missing)} monstats_patched={mon_changed}")
+    report.append(f"[stage1-cow] Enabled preset={preset} pool={len(pool)} chunks={len(chunks)} tc_overwrite_hits={changed} missing_TCs={len(missing)} monstats_patched={mon_changed} path_debug=1")
 
 
 def patch_relax_item_requirements(mod_root: Path, report: list[str]) -> None:
