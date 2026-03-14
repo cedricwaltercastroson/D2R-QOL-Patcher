@@ -42,10 +42,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 STAGE1_STABLE_TYPE_CODES = {
     'tors','helm','glov','boot','belt','shie','head',
     'swor','axe','mace','wand','scep','staf','spea','knif','pole',
-    'bow','xbow','orb','ring','amul','hamm','jave',
+    'bow','xbow','orb','ring','amul','hamm',
 }
 # Categories we never port/enrich in Stage-1 (known-crashy or explicitly excluded pools)
-STAGE1_EXCLUDED_TYPE_CODES = {'thro','club','jewl','rune','scha','mcha','lcha','gcha'}
+STAGE1_EXCLUDED_TYPE_CODES = {'jave','thro','club','jewl','rune','scha','mcha','lcha','gcha'}
 
 
 def _validate_stage1_type_lists(report: list[str] | None = None) -> None:
@@ -2726,6 +2726,134 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
     if skipped_bases:
         report.append(f"[classic-port] skipped_bases_class_locked(sample): {', '.join(sorted(list(skipped_bases))[:25])}")
 
+
+
+def _stage1_hard_materialize_and_verify_tc(
+    p_tc: Path,
+    main_tc: str,
+    sub_names: list[str],
+    chunks: list[list[str]],
+    report: list[str],
+) -> tuple[int, int]:
+    """
+    Re-open the saved treasureclassex.txt, hard-materialize the Stage-1 root/chunk rows and
+    known cow alias roots, save again, then verify the rows really exist.
+
+    Returns:
+      (repaired_rows, alias_rows_forced)
+    Raises:
+      RuntimeError if required synthetic rows are still missing after the repair pass.
+    """
+    th2, rows2, nl2 = read_tsv(p_tc)
+    col_name = find_column_by_name(th2, "Treasure Class") or find_column_by_name(th2, "TreasureClass")
+    col_picks = find_column_by_name(th2, "Picks")
+    col_nodrop = find_column_by_name(th2, "NoDrop")
+
+    item_cols = []
+    prob_cols = []
+    for i in range(1, 11):
+        ic = find_column_by_name(th2, f"Item{i}")
+        pc = find_column_by_name(th2, f"Prob{i}")
+        if ic and pc:
+            item_cols.append(ic)
+            prob_cols.append(pc)
+
+    if not (col_name and col_picks and col_nodrop and len(item_cols) == 10):
+        raise RuntimeError("treasureclassex header missing expected columns during Stage-1 hard verify")
+
+    def mk_row(name: str):
+        r = {k: "" for k in th2}
+        r[col_name] = name
+        r[col_picks] = "1"
+        r[col_nodrop] = "0"
+        for ic, pc in zip(item_cols, prob_cols):
+            r[ic] = ""
+            r[pc] = "0"
+        return r
+
+    by_name = {}
+    for r in rows2:
+        nm = (r.get(col_name) or "").strip()
+        if nm:
+            by_name[nm] = r
+
+    repaired = 0
+
+    # Root row
+    root = by_name.get(main_tc)
+    if root is None:
+        root = mk_row(main_tc)
+        rows2.append(root)
+        by_name[main_tc] = root
+        repaired += 1
+    root[col_picks] = "1"
+    root[col_nodrop] = "0"
+    for ic, pc in zip(item_cols, prob_cols):
+        root[ic] = ""
+        root[pc] = "0"
+    for i, sub in enumerate(sub_names[:10]):
+        root[item_cols[i]] = sub
+        root[prob_cols[i]] = "1"
+
+    # Chunk rows
+    for idx, ch in enumerate(chunks, start=1):
+        sub = f"{main_tc}_{idx:02d}"
+        rr = by_name.get(sub)
+        if rr is None:
+            rr = mk_row(sub)
+            rows2.append(rr)
+            by_name[sub] = rr
+            repaired += 1
+        rr[col_picks] = "1"
+        rr[col_nodrop] = "0"
+        for ic, pc in zip(item_cols, prob_cols):
+            rr[ic] = ""
+            rr[pc] = "0"
+        for i, code in enumerate(ch[:10]):
+            rr[item_cols[i]] = code
+            rr[prob_cols[i]] = "1"
+
+    # Alias roots: force all known cow-related alias TCs directly to main_tc
+    alias_targets = (
+        "Cow", "Cow (N)", "Cow (H)",
+        "Act 4 Champ B", "Act 4 Unique B",
+        "Act 4 (N) Champ B", "Act 4 (N) Unique B",
+        "Act 4 (H) Champ B", "Act 4 (H) Unique B",
+        "Act 4 (H) Champ B Desecrated", "Act 4 (H) Unique B Desecrated",
+        "Act 4 (N) Champ B Desecrated", "Act 4 (N) Unique B Desecrated",
+    )
+    alias_rows = 0
+    for nm in alias_targets:
+        rr = by_name.get(nm)
+        if rr is None:
+            rr = mk_row(nm)
+            rows2.append(rr)
+            by_name[nm] = rr
+            repaired += 1
+        rr[col_picks] = "1"
+        rr[col_nodrop] = "0"
+        for ic, pc in zip(item_cols, prob_cols):
+            rr[ic] = ""
+            rr[pc] = "0"
+        rr[item_cols[0]] = main_tc
+        rr[prob_cols[0]] = "1"
+        alias_rows += 1
+
+    write_tsv(p_tc, th2, rows2, nl2)
+
+    # Verify after save
+    th3, rows3, _ = read_tsv(p_tc)
+    col_name3 = find_column_by_name(th3, "Treasure Class") or find_column_by_name(th3, "TreasureClass")
+    have = set((r.get(col_name3) or "").strip() for r in rows3)
+    need = {main_tc, "Cow", "Cow (N)", "Cow (H)"}
+    for idx in range(1, len(chunks) + 1):
+        need.add(f"{main_tc}_{idx:02d}")
+    missing = sorted(n for n in need if n not in have)
+    report.append(f"[stage1-cow-verify] root={main_tc} repaired_rows={repaired} verified_missing={len(missing)} alias_rows={alias_rows}")
+    if missing:
+        raise RuntimeError("Stage-1 hard verify missing rows: " + ", ".join(missing[:10]))
+
+    return repaired, alias_rows
 def apply_stage1_cow_harness(mod_root: Path, vanilla_root: Path, report: list[str], preset: str) -> None:
     """Stage-1 Cow Harness (process-of-elimination)
 
@@ -2971,19 +3099,9 @@ def apply_stage1_cow_harness(mod_root: Path, vanilla_root: Path, report: list[st
             missing.remove(n)
 
     write_tsv(p_tc, th, tc_rows)
-
-    # Debug instrumentation: print exactly which treasureclassex.txt was written and whether
-    # the Stage-1 synthetic rows exist immediately after the save.
-    try:
-        _th_dbg, _rows_dbg, _ = read_tsv(p_tc)
-        _name_dbg = find_column_by_name(_th_dbg, "Treasure Class") or find_column_by_name(_th_dbg, "TreasureClass")
-        _have_dbg = set((r.get(_name_dbg) or "").strip() for r in _rows_dbg)
-        _dbg_need = [main_tc] + [f"{main_tc}_{i:02d}" for i in range(1, len(chunks)+1)]
-        _dbg_hits = [n for n in _dbg_need if n in _have_dbg]
-        report.append(f"[stage1-cow-path] treasureclassex_path={p_tc}")
-        report.append(f"[stage1-cow-path] synthetic_rows_present={len(_dbg_hits)}/{len(_dbg_need)} first={_dbg_hits[:5]}")
-    except Exception as e:
-        report.append(f"[stage1-cow-path] ERROR: {e}")
+    hardverify_rows, alias_rows = _stage1_hard_materialize_and_verify_tc(
+        p_tc, main_tc, sub_names, chunks, report
+    )
 
     # Patch monstats HellBovine + Cow King to point directly at our stage TCs for all variants
     mon_changed = 0
@@ -3011,7 +3129,7 @@ def apply_stage1_cow_harness(mod_root: Path, vanilla_root: Path, report: list[st
         if mon_changed:
             write_tsv(p_mon, mh, mrows)
 
-    report.append(f"[stage1-cow] Enabled preset={preset} pool={len(pool)} chunks={len(chunks)} tc_overwrite_hits={changed} missing_TCs={len(missing)} monstats_patched={mon_changed} path_debug=1")
+    report.append(f"[stage1-cow] Enabled preset={preset} pool={len(pool)} chunks={len(chunks)} tc_overwrite_hits={changed} missing_TCs={len(missing)} monstats_patched={mon_changed} alias_rows={alias_rows} hardverify_rows={hardverify_rows}")
 
 
 def patch_relax_item_requirements(mod_root: Path, report: list[str]) -> None:
@@ -3370,6 +3488,207 @@ def apply_stage5_stash_lodish(mod_root: Path, vanilla_root: Path, report: list[s
     report.append(f"[stage5-stash] APPLIED: generated bankoriginallayout(.hd).json from vanilla bankexpansion deltas (files={generated}, controller_files={controller_generated})")
 
 
+
+
+def apply_stage6_merc_equip_probe(mod_root: Path, report: list[str], enabled: bool=False) -> None:
+    """Stage 6 probe: enable merc equipment backend and copy LoD merc UI panels.
+
+    Stable baseline only:
+    - Adds amulet/ring/gloves/belt/boots slots to Hireling/Hireling2 by copying
+      safe coordinates from Amazon/Amazon2 inventory rows.
+    - Relaxes hireable merc weapon restrictions in monstats.
+    - Copies merc UI layouts (portrait + inventory panels + HUD layouts) into output.
+    - Best-effort injects portrait click open message for the merc portrait panel.
+
+    NOTE: HUD-button / hotkey routing remains unresolved and is intentionally not
+    modified here to preserve HUD stability.
+    """
+    if not enabled:
+        report.append("[stage6-merc] Disabled (flag off); skipped")
+        return
+
+    inv_p = mod_root / "data" / "global" / "excel" / "inventory.txt"
+    mon_p = mod_root / "data" / "global" / "excel" / "monstats.txt"
+    ui_dir = mod_root / "data" / "global" / "ui" / "layouts"
+    ui_dir.mkdir(parents=True, exist_ok=True)
+
+    if not inv_p.exists() or not mon_p.exists():
+        report.append(f"[stage6-merc] SKIP: missing required files inventory={inv_p.exists()} monstats={mon_p.exists()}")
+        return
+
+    inv_header, inv_rows, inv_nl = read_tsv(inv_p)
+    if not inv_rows:
+        report.append('[stage6-merc] SKIP: inventory.txt empty')
+        return
+    row_map = {str(r.get('class','')).strip().lower(): r for r in inv_rows if isinstance(r, dict)}
+    src1 = row_map.get('amazon') or row_map.get('barbarian') or row_map.get('sorceress')
+    src2 = row_map.get('amazon2') or row_map.get('barbarian2') or row_map.get('sorceress2')
+    dst1 = row_map.get('hireling')
+    dst2 = row_map.get('hireling2')
+
+    slot_fields = {
+        'rarm': ('rArmLeft','rArmRight','rArmTop','rArmBottom'),
+        'larm': ('lArmLeft','lArmRight','lArmTop','lArmBottom'),
+        'head': ('headLeft','headRight','headTop','headBottom'),
+        'torso': ('torsoLeft','torsoRight','torsoTop','torsoBottom'),
+        'neck': ('neckLeft','neckRight','neckTop','neckBottom'),
+        'rrin': ('rRingLeft','rRingRight','rRingTop','rRingBottom'),
+        'lrin': ('lRingLeft','lRingRight','lRingTop','lRingBottom'),
+        'belt': ('beltLeft','beltRight','beltTop','beltBottom'),
+        'feet': ('feetLeft','feetRight','feetTop','feetBottom'),
+        'glov': ('glovesLeft','glovesRight','glovesTop','glovesBottom'),
+    }
+
+    inv_slot_rows = 0
+    inv_slot_cells = 0
+    for dst, src_row in ((dst1, src1), (dst2, src2)):
+        if not dst or not src_row:
+            continue
+        inv_slot_rows += 1
+        for fields in slot_fields.values():
+            for f in fields:
+                if f in dst and f in src_row:
+                    newv = src_row.get(f, '')
+                    if dst.get(f, '') != newv:
+                        dst[f] = newv
+                        inv_slot_cells += 1
+        for f in ('gridX','gridY','gridLeft','gridRight','gridTop','gridBottom'):
+            if f in dst and f in src_row and dst.get(f,'') != src_row.get(f,''):
+                dst[f] = src_row.get(f,'')
+                inv_slot_cells += 1
+    write_tsv(inv_p, inv_header, inv_rows, inv_nl)
+
+    mon_header, mon_rows, mon_nl = read_tsv(mon_p)
+    mon_rows_changed = 0
+    mon_cells_changed = 0
+    merc_ids = {'roguehire','act2hire','act3hire','act5hire1','act5hire2'}
+    for r in mon_rows:
+        if not isinstance(r, dict):
+            continue
+        mid = str(r.get('Id','') or r.get('ID','') or r.get('*ID','')).strip().lower()
+        ai = str(r.get('AI','')).strip().lower()
+        if not mid and not ai:
+            continue
+        if mid not in merc_ids and ai != 'hireable':
+            continue
+        row_changed = False
+        for col, val in (
+            ('inventory','1'),
+            ('canNotUseTwoHandedItems','0'),
+            ('leftArmItemType',''),
+            ('rightArmItemType',''),
+            ('canUseNoItem','1'),
+        ):
+            if col in r and r.get(col,'') != val:
+                r[col] = val
+                mon_cells_changed += 1
+                row_changed = True
+        if row_changed:
+            mon_rows_changed += 1
+    write_tsv(mon_p, mon_header, mon_rows, mon_nl)
+
+    vanilla_root = _VANILLA_ROOT
+    if vanilla_root is None:
+        report.append('[stage6-merc] SKIP: _VANILLA_ROOT not initialized')
+        return
+
+    src_layout_dir = vanilla_root / 'data' / 'global' / 'ui' / 'layouts'
+    ui_files = [
+        'hireablespanel.json', 'hireablespanelhd.json',
+        'hirelinginventorypanel.json', 'hirelinginventorypanelhd.json',
+        'hudpanel.json', 'hudpanelhd.json',
+    ]
+    ui_copied = 0
+    ui_click_wired = 0
+    wired_names: list[str] = []
+    missing_names: list[str] = []
+    stage61_notes: list[str] = []
+
+    def _inject_message_into_widget_fields(txt: str, widget_name: str, message: str) -> tuple[str, bool]:
+        # Target a named widget and either add fields{} or add onClickMessage into existing fields.
+        pat = re.compile(r'("name"\s*:\s*"' + re.escape(widget_name) + r'"[^{}]*?)(,\s*"fields"\s*:\s*\{.*?\})?', re.DOTALL)
+        m = pat.search(txt)
+        if not m:
+            return txt, False
+        block = m.group(0)
+        if 'onClickMessage' in block:
+            return txt, False
+        if m.group(2):
+            repl = block.replace(m.group(2), m.group(2)[:-1] + ', "onClickMessage": "' + message + '" }')
+        else:
+            repl = block + ', "fields": { "onClickMessage": "' + message + '" }'
+        return txt[:m.start()] + repl + txt[m.end():], True
+
+    def _inject_portrait_route(txt: str) -> tuple[str, list[str]]:
+        # Stage6.1a: patch several plausible clickable portrait nodes rather than only Template.
+        changed = []
+        for widget_name in (
+            'Template', 'Portrait', 'HirelingPortraitPanel', 'HirelingPortrait',
+            'MercPortrait', 'MercenaryPortrait', 'HirelingButton', 'MercButton',
+            'Button', 'PortraitButton'
+        ):
+            new_txt, ok = _inject_message_into_widget_fields(txt, widget_name, 'HirelingInventoryPanelMessage:Open')
+            if ok:
+                txt = new_txt
+                changed.append(widget_name)
+        # Fallback: legacy exact replacement for the old Template image widget.
+        needle = '"type": "AbstractImageWidget", "name": "Template",'
+        replacement = '"type": "AbstractImageWidget", "name": "Template", "fields": { "onClickMessage": "HirelingInventoryPanelMessage:Open" },'
+        if 'HirelingInventoryPanelMessage:Open' not in txt and needle in txt:
+            txt = txt.replace(needle, replacement, 1)
+            changed.append('Template[legacy]')
+        # Ensure panel message symbol is present on hireables panel text so the route is at least serialized.
+        if 'HirelingInventoryPanelMessage:Open' not in txt:
+            txt += '\n/* stage6.1a-note: merc portrait route unresolved; no suitable widget matched */\n'
+        return txt, changed
+
+    for name in ui_files:
+        src = src_layout_dir / name
+        if not src.exists():
+            missing_names.append(name)
+            continue
+        txt = src.read_text(encoding='utf-8')
+        if name.startswith('hireablespanel'):
+            txt, changed_nodes = _inject_portrait_route(txt)
+            if changed_nodes:
+                ui_click_wired += 1
+                wired_names.append(name + ' -> ' + ', '.join(changed_nodes))
+            else:
+                stage61_notes.append(name + ': no clickable portrait widget pattern matched')
+        (ui_dir / name).write_text(txt, encoding='utf-8')
+        ui_copied += 1
+        report.append(f'[stage6-merc-ui] copied: {name}')
+
+    # Discovery pass retained for future Stage6.1b hotkey work.
+    hotkey_candidates = []
+    scan_roots = [vanilla_root / 'data' / 'global' / 'ui', vanilla_root / 'hd' / 'global' / 'excel']
+    seen = set()
+    for root in scan_roots:
+        if not root.exists():
+            continue
+        for p in root.rglob('*.json'):
+            rel = p.relative_to(vanilla_root).as_posix().lower()
+            name = p.name.lower()
+            if any(tok in name for tok in ('control', 'input', 'key', 'bind', 'hotkey')) or any(tok in rel for tok in ('control', 'input', 'keybind', 'hotkey')):
+                if rel not in seen:
+                    seen.add(rel)
+                    hotkey_candidates.append(rel)
+    report.append('[stage6-merc] probe enabled: expanded merc accessory slots + relaxed hireable weapon restrictions')
+    report.append('[stage6-merc] V19 stage6.1a portrait-routing continuation active (broad portrait node injection; hotkey still deferred)')
+    report.append(f'[stage6-merc] inventory.txt rows patched={inv_slot_rows} cells={inv_slot_cells} (Hireling/Hireling2 accessory slots)')
+    report.append(f'[stage6-merc] monstats.txt rows patched={mon_rows_changed} cells={mon_cells_changed} (inventory=1, canNotUseTwoHandedItems=0)')
+    report.append(f'[stage6-merc-ui] copied merc panel layouts={ui_copied} into output ui/layouts')
+    if missing_names:
+        report.append('[stage6-merc-ui] missing from vanilla ui/layouts: ' + ', '.join(missing_names))
+    if ui_click_wired:
+        report.append(f'[stage6.1a-panel] portrait route injected for {ui_click_wired} layout(s): ' + ', '.join(wired_names))
+    if hotkey_candidates:
+        report.append('[stage6.1b-hotkey] candidate control/input files: ' + ', '.join(hotkey_candidates[:12]))
+    else:
+        report.append('[stage6.1b-hotkey] no obvious control/input json candidates found under vanilla ui / hd excel trees')
+    if stage61_notes:
+        report.append('[stage6.1a-panel] notes: ' + ' | '.join(stage61_notes))
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vanilla", required=True, help="Path to vanilla dump root containing data/ ...")
@@ -3387,6 +3706,7 @@ def main():
     )
     ap.add_argument("--enable-ui", action="store_true", help="Enable UI layout json overrides (default is disabled: files are renamed to disable*).")
     ap.add_argument("--stash-lodish", action="store_true", help="Stage 5: Generate LoD-style large stash for Classic (bankoriginal layouts + inventory bank grid).")
+    ap.add_argument("--enable-merc-equip-probe", action="store_true", help="Stage 6 probe: enable expanded merc equipment slots (amulet/rings/gloves/belt/boots) and relax hireable weapon restrictions for testing.")
     ap.add_argument("--patch-sources", default=str(Path(__file__).parent/"patch_sources"),
                     help="Folder containing cubemain.txt and UI json overrides")
     args = ap.parse_args()
@@ -3528,6 +3848,11 @@ def main():
     # 4) Write run log
     if getattr(args, "stash_lodish", False):
         apply_stage5_stash_lodish(mod_root, vanilla_root, report)
+
+    try:
+        apply_stage6_merc_equip_probe(mod_root, report, enabled=getattr(args, "enable_merc_equip_probe", False))
+    except Exception as e:
+        report.append(f"[stage6-merc] ERROR: {type(e).__name__}: {e}")
 
     (out/"log.txt").write_text("\n".join(report), encoding="utf-8")
     print("Patched mod tree written to:", out)

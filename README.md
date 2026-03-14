@@ -1,4 +1,4 @@
-# D2R Classic++ Forge & Port Patcher (R186)
+# D2R Classic++ Forge & Port Patcher (R127)
 
 <img width="1920" height="1080" alt="image" src="https://github.com/user-attachments/assets/dcaed8b3-2ce7-4622-bec8-b16217e06a66" />
 
@@ -6,7 +6,7 @@
 
 Built and validated against:
 **Diablo II: Resurrected (PC) — Classic Offline**
-**Build: v1.6.81914**
+**Build: v1.6.77312**
 
 Scope: Classic only. Expansion content may be safely ported into Classic via this patcher.
 
