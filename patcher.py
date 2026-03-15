@@ -2726,134 +2726,6 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
     if skipped_bases:
         report.append(f"[classic-port] skipped_bases_class_locked(sample): {', '.join(sorted(list(skipped_bases))[:25])}")
 
-
-
-def _stage1_hard_materialize_and_verify_tc(
-    p_tc: Path,
-    main_tc: str,
-    sub_names: list[str],
-    chunks: list[list[str]],
-    report: list[str],
-) -> tuple[int, int]:
-    """
-    Re-open the saved treasureclassex.txt, hard-materialize the Stage-1 root/chunk rows and
-    known cow alias roots, save again, then verify the rows really exist.
-
-    Returns:
-      (repaired_rows, alias_rows_forced)
-    Raises:
-      RuntimeError if required synthetic rows are still missing after the repair pass.
-    """
-    th2, rows2, nl2 = read_tsv(p_tc)
-    col_name = find_column_by_name(th2, "Treasure Class") or find_column_by_name(th2, "TreasureClass")
-    col_picks = find_column_by_name(th2, "Picks")
-    col_nodrop = find_column_by_name(th2, "NoDrop")
-
-    item_cols = []
-    prob_cols = []
-    for i in range(1, 11):
-        ic = find_column_by_name(th2, f"Item{i}")
-        pc = find_column_by_name(th2, f"Prob{i}")
-        if ic and pc:
-            item_cols.append(ic)
-            prob_cols.append(pc)
-
-    if not (col_name and col_picks and col_nodrop and len(item_cols) == 10):
-        raise RuntimeError("treasureclassex header missing expected columns during Stage-1 hard verify")
-
-    def mk_row(name: str):
-        r = {k: "" for k in th2}
-        r[col_name] = name
-        r[col_picks] = "1"
-        r[col_nodrop] = "0"
-        for ic, pc in zip(item_cols, prob_cols):
-            r[ic] = ""
-            r[pc] = "0"
-        return r
-
-    by_name = {}
-    for r in rows2:
-        nm = (r.get(col_name) or "").strip()
-        if nm:
-            by_name[nm] = r
-
-    repaired = 0
-
-    # Root row
-    root = by_name.get(main_tc)
-    if root is None:
-        root = mk_row(main_tc)
-        rows2.append(root)
-        by_name[main_tc] = root
-        repaired += 1
-    root[col_picks] = "1"
-    root[col_nodrop] = "0"
-    for ic, pc in zip(item_cols, prob_cols):
-        root[ic] = ""
-        root[pc] = "0"
-    for i, sub in enumerate(sub_names[:10]):
-        root[item_cols[i]] = sub
-        root[prob_cols[i]] = "1"
-
-    # Chunk rows
-    for idx, ch in enumerate(chunks, start=1):
-        sub = f"{main_tc}_{idx:02d}"
-        rr = by_name.get(sub)
-        if rr is None:
-            rr = mk_row(sub)
-            rows2.append(rr)
-            by_name[sub] = rr
-            repaired += 1
-        rr[col_picks] = "1"
-        rr[col_nodrop] = "0"
-        for ic, pc in zip(item_cols, prob_cols):
-            rr[ic] = ""
-            rr[pc] = "0"
-        for i, code in enumerate(ch[:10]):
-            rr[item_cols[i]] = code
-            rr[prob_cols[i]] = "1"
-
-    # Alias roots: force all known cow-related alias TCs directly to main_tc
-    alias_targets = (
-        "Cow", "Cow (N)", "Cow (H)",
-        "Act 4 Champ B", "Act 4 Unique B",
-        "Act 4 (N) Champ B", "Act 4 (N) Unique B",
-        "Act 4 (H) Champ B", "Act 4 (H) Unique B",
-        "Act 4 (H) Champ B Desecrated", "Act 4 (H) Unique B Desecrated",
-        "Act 4 (N) Champ B Desecrated", "Act 4 (N) Unique B Desecrated",
-    )
-    alias_rows = 0
-    for nm in alias_targets:
-        rr = by_name.get(nm)
-        if rr is None:
-            rr = mk_row(nm)
-            rows2.append(rr)
-            by_name[nm] = rr
-            repaired += 1
-        rr[col_picks] = "1"
-        rr[col_nodrop] = "0"
-        for ic, pc in zip(item_cols, prob_cols):
-            rr[ic] = ""
-            rr[pc] = "0"
-        rr[item_cols[0]] = main_tc
-        rr[prob_cols[0]] = "1"
-        alias_rows += 1
-
-    write_tsv(p_tc, th2, rows2, nl2)
-
-    # Verify after save
-    th3, rows3, _ = read_tsv(p_tc)
-    col_name3 = find_column_by_name(th3, "Treasure Class") or find_column_by_name(th3, "TreasureClass")
-    have = set((r.get(col_name3) or "").strip() for r in rows3)
-    need = {main_tc, "Cow", "Cow (N)", "Cow (H)"}
-    for idx in range(1, len(chunks) + 1):
-        need.add(f"{main_tc}_{idx:02d}")
-    missing = sorted(n for n in need if n not in have)
-    report.append(f"[stage1-cow-verify] root={main_tc} repaired_rows={repaired} verified_missing={len(missing)} alias_rows={alias_rows}")
-    if missing:
-        raise RuntimeError("Stage-1 hard verify missing rows: " + ", ".join(missing[:10]))
-
-    return repaired, alias_rows
 def apply_stage1_cow_harness(mod_root: Path, vanilla_root: Path, report: list[str], preset: str) -> None:
     """Stage-1 Cow Harness (process-of-elimination)
 
@@ -3099,9 +2971,6 @@ def apply_stage1_cow_harness(mod_root: Path, vanilla_root: Path, report: list[st
             missing.remove(n)
 
     write_tsv(p_tc, th, tc_rows)
-    hardverify_rows, alias_rows = _stage1_hard_materialize_and_verify_tc(
-        p_tc, main_tc, sub_names, chunks, report
-    )
 
     # Patch monstats HellBovine + Cow King to point directly at our stage TCs for all variants
     mon_changed = 0
@@ -3129,7 +2998,7 @@ def apply_stage1_cow_harness(mod_root: Path, vanilla_root: Path, report: list[st
         if mon_changed:
             write_tsv(p_mon, mh, mrows)
 
-    report.append(f"[stage1-cow] Enabled preset={preset} pool={len(pool)} chunks={len(chunks)} tc_overwrite_hits={changed} missing_TCs={len(missing)} monstats_patched={mon_changed} alias_rows={alias_rows} hardverify_rows={hardverify_rows}")
+    report.append(f"[stage1-cow] Enabled preset={preset} pool={len(pool)} chunks={len(chunks)} tc_overwrite_hits={changed} missing_TCs={len(missing)} monstats_patched={mon_changed}")
 
 
 def patch_relax_item_requirements(mod_root: Path, report: list[str]) -> None:
@@ -3689,6 +3558,105 @@ def apply_stage6_merc_equip_probe(mod_root: Path, report: list[str], enabled: bo
     if stage61_notes:
         report.append('[stage6.1a-panel] notes: ' + ' | '.join(stage61_notes))
 
+
+def patch_skilldesc_holy_aura_direct_single_value(mod_root: Path, report: list[str]) -> None:
+    """
+    Final holy aura tooltip cleanup:
+    - keep a single numeric damage line only
+    - use one-placeholder label StrSkillDamageFlat
+    - use the original max-side holy aura display formula exma*((100+par6)/100)
+      so the shown value matches the former max, not the lower side
+    - remove the duplicate attack-damage numeric line
+    """
+    p = mod_root / "data" / "global" / "excel" / "skilldesc.txt"
+    if not p.exists():
+        report.append("[skilldesc-holy-direct] SKIP: skilldesc.txt missing")
+        return
+
+    h, rows, nl = read_tsv(p)
+    skilldesc_col = find_column_by_name(h, "skilldesc") or "skilldesc"
+
+    changed_rows = 0
+    changed_cells = 0
+
+    def setv(r, col, val):
+        nonlocal changed_cells
+        if col in h and (r.get(col) or "") != val:
+            r[col] = val
+            changed_cells += 1
+            return True
+        return False
+
+    max_formula = "exma*((100+par6)/100)"
+
+    for r in rows:
+        name = (r.get(skilldesc_col) or "").strip().lower()
+        if name not in {"holy fire", "holy freeze", "holy shock"}:
+            continue
+
+        row_changed = False
+
+        # Kill any built-in range formatter
+        row_changed |= setv(r, "descdam", "")
+        row_changed |= setv(r, "ddam calc1", "")
+        row_changed |= setv(r, "ddam calc2", "")
+
+        # Clear duplicate / B-side fields
+        for col in (
+            "desctextb2", "desctextb3", "desctextb4",
+            "desccalcb2", "desccalcb3", "desccalcb4",
+        ):
+            row_changed |= setv(r, col, "")
+
+        if name == "holy fire":
+            row_changed |= setv(r, "descline2", "74")
+            row_changed |= setv(r, "desctexta2", "StrSkillDamageFlat")
+            row_changed |= setv(r, "desccalca2", max_formula)
+
+            # Remove duplicate numeric line
+            row_changed |= setv(r, "descline3", "")
+            row_changed |= setv(r, "desctexta3", "")
+            row_changed |= setv(r, "desctextb3", "")
+            row_changed |= setv(r, "desccalca3", "")
+            row_changed |= setv(r, "desccalcb3", "")
+
+        elif name == "holy freeze":
+            # Keep slow/chill line 2 intact.
+            row_changed |= setv(r, "descline3", "74")
+            row_changed |= setv(r, "desctexta3", "StrSkillDamageFlat")
+            row_changed |= setv(r, "desccalca3", max_formula)
+            row_changed |= setv(r, "desctextb3", "")
+            row_changed |= setv(r, "desccalcb3", "")
+
+            # Remove duplicate numeric line
+            row_changed |= setv(r, "descline4", "")
+            row_changed |= setv(r, "desctexta4", "")
+            row_changed |= setv(r, "desctextb4", "")
+            row_changed |= setv(r, "desccalca4", "")
+            row_changed |= setv(r, "desccalcb4", "")
+
+        elif name == "holy shock":
+            row_changed |= setv(r, "descline2", "74")
+            row_changed |= setv(r, "desctexta2", "StrSkillDamageFlat")
+            row_changed |= setv(r, "desccalca2", max_formula)
+            row_changed |= setv(r, "desctextb2", "")
+            row_changed |= setv(r, "desccalcb2", "")
+
+            # Remove duplicate numeric line
+            row_changed |= setv(r, "descline3", "")
+            row_changed |= setv(r, "desctexta3", "")
+            row_changed |= setv(r, "desctextb3", "")
+            row_changed |= setv(r, "desccalca3", "")
+            row_changed |= setv(r, "desccalcb3", "")
+
+        if row_changed:
+            changed_rows += 1
+
+    if changed_rows:
+        write_tsv(p, h, rows, nl)
+
+    report.append(f"[skilldesc-holy-direct] APPLIED: rows_changed={changed_rows} cells_changed={changed_cells} targets=holy fire,holy freeze,holy shock mode=single_true_max_no_dupe")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vanilla", required=True, help="Path to vanilla dump root containing data/ ...")
@@ -3797,6 +3765,7 @@ def main():
     patch_charstats_from_reference(mod_root, patch_sources, report)
 
     apply_qol_baseline(mod_root, patch_sources, report)
+    patch_skilldesc_holy_aura_direct_single_value(mod_root, report)
 
     # Stage 0 optional: disable low quality item drops (cracked/crude/damaged) by forcing Normal success in itemratio.
     try:

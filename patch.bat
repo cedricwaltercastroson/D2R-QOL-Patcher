@@ -1,7 +1,7 @@
 @echo off
 
 REM =========================================================
-REM  D2R Classic++ Patcher Control Panel (R120 Canonical)
+REM  D2R Classic++ Patcher Control Panel (R200 Canonical)
 REM =========================================================
 REM
 REM Usage:
