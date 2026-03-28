@@ -3357,6 +3357,173 @@ def apply_stage5_stash_lodish(mod_root: Path, vanilla_root: Path, report: list[s
     report.append(f"[stage5-stash] APPLIED: generated bankoriginallayout(.hd).json from vanilla bankexpansion deltas (files={generated}, controller_files={controller_generated})")
 
 
+
+def patch_skills_flatten_holy_aura_damage(mod_root: Path, report: list[str]) -> None:
+    """
+    Flat-max the elemental aura pulse damage for Holy Fire / Holy Freeze / Holy Shock
+    by copying EMax progression into EMin progression.
+    """
+    p = mod_root / "data" / "global" / "excel" / "skills.txt"
+    if not p.exists():
+        report.append("[skills-flat-holy] SKIP: skills.txt missing")
+        return
+
+    h, rows, nl = read_tsv(p)
+    skill_col = find_column_by_name(h, "skill") or "skill"
+    targets = {"Holy Fire", "Holy Freeze", "Holy Shock"}
+
+    pairs = [
+        ("EMin", "EMax"),
+        ("EMinLev1", "EMaxLev1"),
+        ("EMinLev2", "EMaxLev2"),
+        ("EMinLev3", "EMaxLev3"),
+        ("EMinLev4", "EMaxLev4"),
+        ("EMinLev5", "EMaxLev5"),
+    ]
+    pairs = [(a, b) for (a, b) in pairs if a in h and b in h]
+
+    changed_rows = 0
+    changed_cells = 0
+    for r in rows:
+        name = (r.get(skill_col) or "").strip()
+        if name not in targets:
+            continue
+        row_changed = False
+        for min_col, max_col in pairs:
+            max_val = (r.get(max_col) or "")
+            if max_val != "" and (r.get(min_col) or "") != max_val:
+                r[min_col] = max_val
+                changed_cells += 1
+                row_changed = True
+        if row_changed:
+            changed_rows += 1
+
+    if changed_rows:
+        write_tsv(p, h, rows, nl)
+
+    report.append(f"[skills-flat-holy] APPLIED: rows_changed={changed_rows} cells_changed={changed_cells} targets=Holy Fire,Holy Freeze,Holy Shock")
+
+
+def patch_skills_flatten_holy_aura_actual_damage(mod_root: Path, report: list[str]) -> None:
+    """
+    Flat-max the passive added weapon damage for Holy Fire / Holy Freeze / Holy Shock
+    by copying passive max stat/calc into passive min stat/calc.
+    """
+    p = mod_root / "data" / "global" / "excel" / "skills.txt"
+    if not p.exists():
+        report.append("[skills-flat-holy-actual] SKIP: skills.txt missing")
+        return
+
+    h, rows, nl = read_tsv(p)
+    skill_col = find_column_by_name(h, "skill") or "skill"
+    targets = {"Holy Fire", "Holy Freeze", "Holy Shock"}
+
+    needed = {"passivestat1", "passivestat2", "passivecalc1", "passivecalc2"}
+    if not needed.issubset(set(h)):
+        report.append("[skills-flat-holy-actual] SKIP: passive columns missing")
+        return
+
+    changed_rows = 0
+    changed_cells = 0
+    for r in rows:
+        name = (r.get(skill_col) or "").strip()
+        if name not in targets:
+            continue
+        row_changed = False
+        pstat2 = (r.get("passivestat2") or "")
+        pcalc2 = (r.get("passivecalc2") or "")
+
+        if pstat2 != "" and (r.get("passivestat1") or "") != pstat2:
+            r["passivestat1"] = pstat2
+            changed_cells += 1
+            row_changed = True
+        if pcalc2 != "" and (r.get("passivecalc1") or "") != pcalc2:
+            r["passivecalc1"] = pcalc2
+            changed_cells += 1
+            row_changed = True
+
+        if row_changed:
+            changed_rows += 1
+
+    if changed_rows:
+        write_tsv(p, h, rows, nl)
+
+    report.append(f"[skills-flat-holy-actual] APPLIED: rows_changed={changed_rows} cells_changed={changed_cells} targets=Holy Fire,Holy Freeze,Holy Shock")
+
+
+def patch_skilldesc_holy_aura_direct_single_value(mod_root: Path, report: list[str]) -> None:
+    """
+    Holy aura tooltip cleanup:
+    - one visible numeric damage line only
+    - true-max display formula: exma*((100+par6)/100)
+    - duplicate numeric line removed
+    """
+    p = mod_root / "data" / "global" / "excel" / "skilldesc.txt"
+    if not p.exists():
+        report.append("[skilldesc-holy-direct] SKIP: skilldesc.txt missing")
+        return
+
+    h, rows, nl = read_tsv(p)
+    skilldesc_col = find_column_by_name(h, "skilldesc") or "skilldesc"
+
+    changed_rows = 0
+    changed_cells = 0
+
+    def setv(r, col, val):
+        nonlocal changed_cells
+        if col in h and (r.get(col) or "") != val:
+            r[col] = val
+            changed_cells += 1
+            return True
+        return False
+
+    max_formula = "exma*((100+par6)/100)"
+
+    for r in rows:
+        name = (r.get(skilldesc_col) or "").strip().lower()
+        if name not in {"holy fire", "holy freeze", "holy shock"}:
+            continue
+
+        row_changed = False
+        row_changed |= setv(r, "descdam", "")
+        row_changed |= setv(r, "ddam calc1", "")
+        row_changed |= setv(r, "ddam calc2", "")
+
+        for col in ("desctextb2","desctextb3","desctextb4","desccalcb2","desccalcb3","desccalcb4"):
+            row_changed |= setv(r, col, "")
+
+        if name == "holy fire":
+            row_changed |= setv(r, "descline2", "74")
+            row_changed |= setv(r, "desctexta2", "StrSkillDamageFlat")
+            row_changed |= setv(r, "desccalca2", max_formula)
+
+            for col in ("descline3","desctexta3","desctextb3","desccalca3","desccalcb3"):
+                row_changed |= setv(r, col, "")
+
+        elif name == "holy freeze":
+            row_changed |= setv(r, "descline3", "74")
+            row_changed |= setv(r, "desctexta3", "StrSkillDamageFlat")
+            row_changed |= setv(r, "desccalca3", max_formula)
+
+            for col in ("descline4","desctexta4","desctextb4","desccalca4","desccalcb4"):
+                row_changed |= setv(r, col, "")
+
+        elif name == "holy shock":
+            row_changed |= setv(r, "descline2", "74")
+            row_changed |= setv(r, "desctexta2", "StrSkillDamageFlat")
+            row_changed |= setv(r, "desccalca2", max_formula)
+
+            for col in ("descline3","desctexta3","desctextb3","desccalca3","desccalcb3"):
+                row_changed |= setv(r, col, "")
+
+        if row_changed:
+            changed_rows += 1
+
+    if changed_rows:
+        write_tsv(p, h, rows, nl)
+
+    report.append(f"[skilldesc-holy-direct] APPLIED: rows_changed={changed_rows} cells_changed={changed_cells} targets=holy fire,holy freeze,holy shock mode=single_true_max_no_dupe")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vanilla", required=True, help="Path to vanilla dump root containing data/ ...")
@@ -3464,6 +3631,9 @@ def main():
     patch_charstats_from_reference(mod_root, patch_sources, report)
 
     apply_qol_baseline(mod_root, patch_sources, report)
+    patch_skills_flatten_holy_aura_damage(mod_root, report)
+    patch_skills_flatten_holy_aura_actual_damage(mod_root, report)
+    patch_skilldesc_holy_aura_direct_single_value(mod_root, report)
 
     # Stage 0 optional: disable low quality item drops (cracked/crude/damaged) by forcing Normal success in itemratio.
     try:
