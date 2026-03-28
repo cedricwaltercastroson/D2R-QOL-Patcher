@@ -5,7 +5,7 @@
 Built and validated against:
 
 **Diablo II: Resurrected (PC) — Classic Offline**  
-**Build: v1.6.81914**
+**Build: v1.6.77312**
 
 Scope: **Classic only**. Expansion content may be selectively ported into Classic through the patcher.
 
@@ -24,6 +24,8 @@ This canon build includes:
 - Stage1 TC hard-materialize + cow alias verification logic
 - Holy Fire / Holy Freeze / Holy Shock flat-damage mechanics
 - Holy aura tooltip cleanup (single visible true-max damage line)
+
+JAVE-specific Stage1 harness work is **parked indefinitely** due to likely engine-side behavior in Classic.
 
 ---
 
@@ -108,6 +110,18 @@ The canon patcher keeps the generic Stage1 TC safety work:
 - verifies those rows exist after save
 - patches HellBovine / Cow King monstats TC fields when Stage1 harness is enabled
 
+This remains useful for non-JAVE category harness testing.
+
+### JAVE status
+
+JAVE is **not** part of the current canon harness path.
+
+Reason:
+- repeated testing showed JAVE behavior that does not match other itemtype families
+- evidence strongly suggests Classic engine-specific handling rather than a remaining patcher-structure issue
+
+So JAVE is currently treated as **parked / non-canon research**.
+
 ---
 
 ## Holy Aura Flat-Damage Canon Change
@@ -187,6 +201,7 @@ python patcher.py --vanilla "C:\vanilla" --out "C:\output" --enable-expansion-dr
 
 ## Notes
 
+- JAVE remains parked until a later engine-focused research pass is explicitly resumed.
 - The current canon priority is stability, reproducibility, and clean Classic behavior.
 
 ---
