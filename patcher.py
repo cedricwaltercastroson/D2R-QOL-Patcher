@@ -1,40 +1,223 @@
-import random
-import re
-import os
-
-_VANILLA_ROOT = None  # set in main()
-import json
 #!/usr/bin/env python3
 """
-D2R Mod Updater / Merger (vanilla as source of truth)
+D2R Classic patcher / merger (vanilla as source of truth).
 
-What it does:
-- Takes a NEW vanilla dump (TSV .txt files + UI json if present)
-- Applies your locked intent as deterministic patches:
-  * misc.txt: maxstack (key=50, tbk=80, ibk=80; arrows/bolts remain 500)
-  * armor.txt + weapons.txt: ShowLevel=1 for all rows (except "Expansion" marker)
-  * automagic.txt: force max rolls by setting level=maxlevel and modNmin=modNmax
-  * setitems.txt: force max rolls by setting min*=max* and amin*=amax*
-  * cubemain.txt: inject UNIQUE FORGE / SET FORGE recipes from patch_sources (dedup by signature)
-  * UI json / item-names.json: copied from patch_sources as-is (no JSON reserialization)
-
-Outputs:
-- A merged folder containing patched files (same relative paths as vanilla input)
-- A log.txt describing what changed
+This is a behaviour-preserving cleanup of the known-good patcher branch.
+Cleanup rules applied:
+- Keep current generated mod outcome as the golden reference.
+- Remove unused feature/experiment code from the live patcher.
+- Keep intentional safety guards and wire guards that have no gameplay-output effect.
+- Remove CLI flag dependency; this is now a zero-flag canon runner.
 
 Usage:
-  python patcher.py --vanilla <path_to_new_vanilla_root> --out <path_to_output_root>
+    python patcher.py
+
+Expected folders beside patcher.py:
+    vanilla/
+    static_mod/
+    patch_sources/
+
+Output folder:
+    output/
 
 Notes:
-- Input vanilla root should contain "data/..." as extracted from CASC.
+- vanilla/ must contain data/ as extracted from CASC.
 - This tool never reads or writes .bin files.
 """
-import argparse, csv, hashlib, json, re, shutil
+
+import argparse
 import csv
 import io
+import json
+import os
+import random
+import re
+import shutil
 from pathlib import Path
-import time
+
+_VANILLA_ROOT = None  # set in main()
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Read an optional 0/1-style environment toggle while keeping zero-flag execution."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return int(default)
+
+
+# --- Canon zero-flag profile ---
+# These are intentionally baked in so running `python patcher.py` generates the canon patch.
+# Mirrored from the old canon batch defaults.
+CANON_ENABLE_EXPANSION_DROPS_IN_CLASSIC = True
+CANON_COWALLBASES = True
+CANON_COWCHAOS = True
+CANON_EXP_DROPS_STAGE = 4
+CANON_UITOGGLE = _env_bool("UITOGGLE", False)
+CANON_LODSTASH = True
+CANON_COWALWAYSDROP = True
+CANON_NOLOWQUALITY = True
+CANON_STAGE1_PRESET = ""  # empty = disabled
+COW_XP_MULTIPLIER = 9999
+
+# Stage-4 cow-all-bases determinism.
+# Last verified Stage4 run used this seed; keep it fixed so canon output is reproducible.
+CANON_COW_ALLBASES_SEED = 1782137524
+CANON_COW_ALLBASES_POOL_SIZE = 45
+CANON_COW_ALLBASES_WRAP_PROB = 8192
+CANON_COW_DIRECT_POOL = True  # R200 direct cow pool: cows roll the full mixed zz_cow_allbases wrapper directly.
+# Equalize cow drops across Normal/Nightmare/Hell and across eligible base codes.
+# Without this, FULL CHAOS weights normal/exceptional/elite tiers equally, which overweights elite codes
+# because there are fewer elite codes than normal codes.
+CANON_COW_FLAT_MIXED_POOL = True
+
+# TC enrichment used to front-load a small focus list (including uar/Sacred Armor).
+# For this branch canon we keep enrichment broad/flat so the broader item pool is not
+# visually biased toward a few high-level bases while cows use the flat mixed direct pool.
+CANON_TC_ENRICHMENT_FLAT_NO_FOCUS = True
+
+# R200 safety filter: quest-bound / quest-only bases must never enter cow pools,
+# TC enrichment, or LoD->Classic unique porting. These were filtered out in the
+# original R200 branch; direct cow-pool mode makes the filter more visible/important.
+CANON_FILTER_QUEST_BASES = True
+
+# R200 duplicate-unique preference: Azurewrath has a Classic-era and a LoD-era row.
+# Branch canon prefers the LoD Azurewrath on Phase Blade (base code 7cr) and suppresses
+# older duplicate Azurewrath unique rows. This is unique-row filtering, not base filtering:
+# Phase Blade itself remains allowed in the mixed base pool.
+CANON_PREFER_LOD_AZUREWRATH = True
+R200_AZUREWRATH_LOD_BASE_CODE = '7cr'
+R200_SUPERSEDED_UNIQUE_KEYS: set[tuple[str, str]] = set()  # (unique index/name, base code)
+R200_SUPERSEDED_BASE_CODES: set[str] = set()  # kept for future duplicate-base suppressions
+
+R200_QUEST_RESTRICTED_TYPE_CODES = {
+    'ques', 'quest', 'body', 'part', 'qst', 'questitem',
+}
+R200_QUEST_RESTRICTED_BASE_CODES = {
+    # Act I / generic quest-only objects
+    'leg', 'ear',
+    # Act II staff/cube/viper chain
+    'box', 'hst', 'msf', 'vip',
+    # Act III figurine/book/Khalim chain / Gidbinn variants
+    'j34', 'g34', 'bbb', 'g33', 'qey', 'qhr', 'qbr', 'qf1', 'qf2',
+    # Act IV / Act V quest-only objects
+    'mss', 'hfh', 'tr1', 'tr2', 'std',
+}
+
+def is_r200_quest_restricted_base(code: str, type1: str = '', type2: str = '') -> bool:
+    if not CANON_FILTER_QUEST_BASES:
+        return False
+    c = (code or '').strip().lower()
+    t1 = (type1 or '').strip().lower()
+    t2 = (type2 or '').strip().lower()
+    return (
+        c in R200_QUEST_RESTRICTED_BASE_CODES
+        or t1 in R200_QUEST_RESTRICTED_TYPE_CODES
+        or t2 in R200_QUEST_RESTRICTED_TYPE_CODES
+    )
+
+
+def is_r200_superseded_base_code(code: str) -> bool:
+    return (code or '').strip().lower() in R200_SUPERSEDED_BASE_CODES
+
+
+def is_r200_superseded_unique(index_name: str, base_code: str) -> bool:
+    key = ((index_name or '').strip().lower(), (base_code or '').strip().lower())
+    return key in R200_SUPERSEDED_UNIQUE_KEYS
+
+
+def is_r200_blocked_base(code: str, type1: str = '', type2: str = '') -> bool:
+    """R200 pool/port blocklist: quest/restricted bases + superseded duplicate bases."""
+    return is_r200_quest_restricted_base(code, type1, type2) or is_r200_superseded_base_code(code)
+
+
+def patch_prefer_lod_azurewrath(mod_root: Path, report: list[str]) -> None:
+    """Suppress older duplicate Azurewrath unique rows and prefer LoD Azurewrath.
+
+    LoD Azurewrath is the Phase Blade version (base code 7cr). Classic-era duplicate
+    Azurewrath rows are left in place for row-order safety, but marked not enabled /
+    Expansion-only where possible and registered in R200_SUPERSEDED_UNIQUE_KEYS so the
+    LoD->Classic port layer cannot re-enable them.
+    """
+    if not CANON_PREFER_LOD_AZUREWRATH:
+        report.append('[azurewrath] LoD Azurewrath preference disabled; skipped')
+        return
+
+    p = mod_root / 'data/global/excel/uniqueitems.txt'
+    if not p.exists():
+        report.append('[azurewrath] uniqueitems.txt not found; skipped')
+        return
+
+    h, rows, nl = read_tsv(p)
+    idx_k = find_column_by_name(h, 'index') or find_column_by_name(h, '*index') or h[0]
+    code_k = find_column_by_name(h, 'code')
+    ver_k = find_column_by_name(h, 'version')
+    en_k = find_column_by_name(h, 'enabled')
+    if not code_k:
+        report.append('[azurewrath] uniqueitems.txt missing code column; skipped')
+        return
+
+    def _norm_text(v: str) -> str:
+        return re.sub(r'[^a-z0-9]+', '', (v or '').strip().lower())
+
+    azure_rows: list[tuple[int, str, str]] = []  # row index, unique index/name, base code
+    for i, r in enumerate(rows):
+        idx = (r.get(idx_k) or '').strip()
+        code = (r.get(code_k) or '').strip().lower()
+        # In D2 uniqueitems, the index/name column is the reliable identity. Scan all
+        # string-ish values as a fallback for schema drift.
+        vals = [idx] + [(r.get(c) or '') for c in h if c != idx_k]
+        if any(_norm_text(v) == 'azurewrath' for v in vals):
+            azure_rows.append((i, idx, code))
+
+    if not azure_rows:
+        report.append('[azurewrath] no Azurewrath rows detected; skipped')
+        return
+
+    lod_rows = [(i, idx, code) for (i, idx, code) in azure_rows if code == R200_AZUREWRATH_LOD_BASE_CODE]
+    if not lod_rows:
+        sample = ','.join([f'{idx}:{code}' for _, idx, code in azure_rows[:10]])
+        report.append(f'[azurewrath] WARNING: Azurewrath rows found but LoD base code {R200_AZUREWRATH_LOD_BASE_CODE} was not present; no rows suppressed (rows={sample})')
+        return
+
+    suppressed: list[str] = []
+    changed_cells = 0
+    for i, idx, code in azure_rows:
+        if code == R200_AZUREWRATH_LOD_BASE_CODE:
+            continue
+        R200_SUPERSEDED_UNIQUE_KEYS.add(((idx or '').strip().lower(), code))
+        r = rows[i]
+        if en_k and (r.get(en_k) or '').strip() != '0':
+            r[en_k] = '0'
+            changed_cells += 1
+        # Keep old Azurewrath out of Classic-visible unique pools. The port layer also
+        # checks R200_SUPERSEDED_UNIQUE_KEYS, so this cannot be undone later.
+        if ver_k and (r.get(ver_k) or '').strip() != '100':
+            r[ver_k] = '100'
+            changed_cells += 1
+        suppressed.append(f'{idx}:{code}')
+
+    if changed_cells:
+        write_tsv(p, h, rows, nl)
+
+    if suppressed:
+        report.append(
+            f'[azurewrath] preferred LoD Azurewrath base={R200_AZUREWRATH_LOD_BASE_CODE}; '
+            f'suppressed duplicate Azurewrath row(s)={",".join(suppressed)} cells_changed={changed_cells}'
+        )
+    else:
+        report.append(f'[azurewrath] OK: only LoD Azurewrath base={R200_AZUREWRATH_LOD_BASE_CODE} detected')
 
 # --- Stage-1 harness stability allow/deny lists (single source of truth) ---
 # These drive Classic LoD port gating AND any drop/TC enrichment that depends on "ported" bases.
@@ -54,7 +237,6 @@ def _validate_stage1_type_lists(report: list[str] | None = None) -> None:
         raise RuntimeError(f"PATCHER ASSERTION FAILED: Stage-1 stable/excluded type lists overlap: {sorted(overlap)}")
     if report is not None:
         report.append(f"[stage1-allowlist] stable_types={len(STAGE1_STABLE_TYPE_CODES)} excluded_types={len(STAGE1_EXCLUDED_TYPE_CODES)}")
-
 
 
 def read_tsv(path: Path):
@@ -82,11 +264,11 @@ def write_tsv(path: Path, header, data, newline="\n"):
             w.writerow([r.get(h, "") for h in header])
 
 
-def patch_monstats_cow_xp_boost(mod_root, report, mult=9999):
+def patch_monstats_cow_xp_boost(mod_root, report, mult=COW_XP_MULTIPLIER):
     """Increase XP for Cow Level monsters (hellbovine, cowking) via monstats.txt only.
 
     - Scope: Classic-safe; does not touch levels/treasure classes/experience curve.
-    - Moderate default: 10x.
+    - Canon default: x9999.
     """
     from pathlib import Path
 
@@ -528,106 +710,78 @@ def verify_and_enforce_unique_max_rolls(mod_root: Path, report: list[str]) -> No
         write_tsv(p_uni, hh, rows)
     report.append(f"[unique-maxrolls-verify] classic rows re-fixed: {fixed_rows}, cells: {fixed_cells}")
 
-def patch_setitems_force_max_rolls(mod_root: Path, report: list[str]) -> None:
-    """Force maximum rolls for all ranged stats on setitems.txt (generic; no named special cases)."""
-    rel = Path("data/global/excel/setitems.txt")
-    p = mod_root / rel
-    if not p.exists():
-        report.append(f"[set-max] missing {rel} (skipped)")
-        return
 
-    hh, rows, _ = read_tsv(p)
-
-    def nk(k: str) -> str:
-        return (k or "").strip().lower()
-
-    ver_k = next((k for k in hh if nk(k) == "version"), None)
-    min_cols = [c for c in hh if nk(c).startswith("min") and nk(c)[3:].isdigit()]
-    if not min_cols:
-        report.append("[set-max] no min/max columns found (skipped)")
-        return
-
-    changed_cells = 0
-    changed_rows = 0
-
-    for r in rows:
-        if ver_k:
-            vv = (r.get(ver_k) or "").strip()
-            if vv.lower() == "expansion":
-                continue
-
-        row_changed = False
-        for c in min_cols:
-            # Some property types encode two different semantics in min/max (e.g. chance-to-cast skills:
-            # min = chance, max = skill level). For these, do NOT force min=max.
-            try:
-                idx = int(c[3:])  # "min12" -> 12
-            except Exception:
-                idx = None
-            prop = (r.get(f"prop{idx}") or "").strip().lower() if idx else ""
-            if prop in {
-                "hit-skill", "gethit-skill", "kill-skill", "death-skill", "levelup-skill",
-                "att-skill", "strskill", "cast-skill", "charged",
-            }:
-                continue
-
-            mx = "max" + c[3:]
-            if mx not in hh:
-                continue
-            mxv = (r.get(mx) or "").strip()
-            if not mxv:
-                continue
-            if (r.get(c) or "").strip() != mxv:
-                r[c] = mxv
-                changed_cells += 1
-                row_changed = True
+ROLL_SPECIAL_PROPS_WITH_NON_RANGE_MINMAX = {
+    # For these property encodings min/max are different parameters rather than a random range.
+    # Example: chance-to-cast often stores chance in min and skill level in max.
+    "hit-skill", "gethit-skill", "kill-skill", "death-skill", "levelup-skill",
+    "att-skill", "strskill", "cast-skill", "charged",
+}
 
 
-        if row_changed:
-            changed_rows += 1
+def _row_is_classic_enabled(row: dict[str, str], version_key: str | None, enabled_key: str | None = None) -> bool:
+    v = (row.get(version_key) or "").strip().lower() if version_key else ""
+    e = (row.get(enabled_key) or "").strip() if enabled_key else ""
+    # Treat blank/no version as eligible; skip explicit expansion markers.
+    classic = (v == "" or v == "0")
+    enabled = (e == "" or e == "1")
+    return classic and enabled
 
-    if changed_cells:
-        write_tsv(p, hh, rows)
 
-    report.append(f"[set-max] forced max rolls (rows changed: {changed_rows}, cells: {changed_cells})")
+def _force_roll_pairs_max(
+    rows: list[dict[str, str]],
+    headers: list[str],
+    *,
+    report_tag: str,
+    version_value: str | None = "0",
+    skip_special_props: bool = True,
+    include_set_bonus_pairs: bool = False,
+) -> tuple[int, int]:
+    """Force real ranged roll min columns to their matching max values.
 
-def _force_min_equals_max(rows: list[dict[str, str]], headers: list[str], version_value: str) -> tuple[int, int]:
+    Supports D2/D2R schemas:
+      - min1/max1, min2/max2, ...
+      - mod1min/mod1max, mod2min/mod2max, ...
+      - set bonus amin*/amax* when include_set_bonus_pairs=True.
+
+    Special proc/charged props are intentionally skipped because their min/max cells are
+    separate parameters, not a random roll range.
     """
-    Force "min" roll columns to their corresponding "max" roll values.
+    norm_to_header = {normalize_column_key(h): h for h in headers}
+    version_key = find_column_by_name(headers, "version")
+    enabled_key = find_column_by_name(headers, "enabled")
 
-    Supports two schemas commonly seen in D2R tables:
-      1) min1/max1, min2/max2, ...
-      2) mod1min/mod1max, mod2min/mod2max, ...
+    pairs: list[tuple[str, str, str | None]] = []
 
-    Version gating:
-      - If the table has a 'version' column, only rows with version==version_value are modified.
-      - If the table has no 'version' column (common), all rows are treated as eligible (Classic-only mod safety).
-    Returns (changed_rows, changed_cells).
-    """
-    # Detect whether version gating is available
-    has_version = any(h.lower() == "version" for h in headers)
-
-    pairs: list[tuple[str, str]] = []
-
-    # Schema (1): minN/maxN
-    min_cols = [c for c in headers if c.lower().startswith("min") and c[3:].isdigit()]
-    for c in min_cols:
-        n = c[3:]
-        mx = "max" + n
-        mx_key = next((h for h in headers if h.lower() == mx.lower()), None)
-        if mx_key:
-            pairs.append((c, mx_key))
-
-    # Schema (2): modNmin/modNmax
     for c in headers:
-        m = re.match(r"^mod(\d+)min$", c, flags=re.I)
-        if not m:
+        nk = normalize_column_key(c)
+        m = re.fullmatch(r"min(\d+)", nk)
+        if m:
+            n = m.group(1)
+            mx = norm_to_header.get(f"max{n}")
+            prop = norm_to_header.get(f"prop{n}")
+            if mx:
+                pairs.append((c, mx, prop))
             continue
-        n = m.group(1)
-        mx = f"mod{n}max"
-        mx_key = next((h for h in headers if h.lower() == mx.lower()), None)
-        if mx_key:
-            pairs.append((c, mx_key))
+
+        m = re.fullmatch(r"mod(\d+)min", nk)
+        if m:
+            n = m.group(1)
+            mx = norm_to_header.get(f"mod{n}max")
+            prop = norm_to_header.get(f"mod{n}code") or norm_to_header.get(f"mod{n}")
+            if mx:
+                pairs.append((c, mx, prop))
+            continue
+
+        if include_set_bonus_pairs:
+            # setitems.txt bonus columns are commonly amin1a/amax1a, amin1b/amax1b, etc.
+            m = re.fullmatch(r"amin(.+)", nk)
+            if m:
+                suffix = m.group(1)
+                mx = norm_to_header.get(f"amax{suffix}")
+                prop = norm_to_header.get(f"aprop{suffix}")
+                if mx:
+                    pairs.append((c, mx, prop))
 
     if not pairs:
         return (0, 0)
@@ -636,12 +790,18 @@ def _force_min_equals_max(rows: list[dict[str, str]], headers: list[str], versio
     changed_cells = 0
 
     for r in rows:
-        if has_version:
-            if (r.get("version") or "").strip() != version_value:
+        if version_key is not None:
+            v = (r.get(version_key) or "").strip()
+            if version_value is not None and v != version_value:
                 continue
+        # If there is no version column, all rows are eligible by design.
 
         row_changed = False
-        for mn, mx in pairs:
+        for mn, mx, prop_col in pairs:
+            if skip_special_props and prop_col:
+                prop = (r.get(prop_col) or "").strip().lower()
+                if prop in ROLL_SPECIAL_PROPS_WITH_NON_RANGE_MINMAX:
+                    continue
             mxv = (r.get(mx) or "").strip()
             if mxv == "":
                 continue
@@ -649,167 +809,104 @@ def _force_min_equals_max(rows: list[dict[str, str]], headers: list[str], versio
                 r[mn] = mxv
                 changed_cells += 1
                 row_changed = True
-
         if row_changed:
             changed_rows += 1
 
-    return (changed_rows, changed_cells)
+    return changed_rows, changed_cells
+
+
+def patch_setitems_force_max_rolls(mod_root: Path, report: list[str]) -> None:
+    """Force maximum rolls for set item stat ranges, including set bonus amin/amax columns."""
+    rel = Path("data/global/excel/setitems.txt")
+    p = mod_root / rel
+    if not p.exists():
+        report.append(f"[set-max] missing {rel} (skipped)")
+        return
+    h, rows, nl = read_tsv(p)
+    cr, cc = _force_roll_pairs_max(
+        rows,
+        h,
+        report_tag="set-max",
+        version_value="0",
+        skip_special_props=True,
+        include_set_bonus_pairs=True,
+    )
+    if cc:
+        write_tsv(p, h, rows, nl)
+    report.append(f"[set-max] forced max rolls including set bonuses (rows changed: {cr}, cells: {cc})")
 
 
 def patch_magicprefix_force_max_rolls(mod_root: Path, report: list[str]) -> None:
-    """Force max rolls for all magic prefixes (Classic rows: version=0)."""
+    """Force max rolls for Classic magic prefixes."""
     rel = Path("data/global/excel/magicprefix.txt")
     p = mod_root / rel
     if not p.exists():
         report.append(f"[affix-max] missing {rel} (skipped)")
         return
     h, rows, nl = read_tsv(p)
-    cr, cc = _force_min_equals_max(rows, h, "0")
-    write_tsv(p, h, rows)
+    cr, cc = _force_roll_pairs_max(rows, h, report_tag="affix-max", version_value="0", skip_special_props=True)
+    if cc:
+        write_tsv(p, h, rows, nl)
     report.append(f"[affix-max] magicprefix: forced max rolls (rows changed: {cr}, cells: {cc})")
 
 
 def patch_magicsuffix_force_max_rolls(mod_root: Path, report: list[str]) -> None:
-    """Force max rolls for all magic suffixes (Classic rows: version=0)."""
+    """Force max rolls for Classic magic suffixes."""
     rel = Path("data/global/excel/magicsuffix.txt")
     p = mod_root / rel
     if not p.exists():
         report.append(f"[affix-max] missing {rel} (skipped)")
         return
     h, rows, nl = read_tsv(p)
-    cr, cc = _force_min_equals_max(rows, h, "0")
-    write_tsv(p, h, rows)
+    cr, cc = _force_roll_pairs_max(rows, h, report_tag="affix-max", version_value="0", skip_special_props=True)
+    if cc:
+        write_tsv(p, h, rows, nl)
     report.append(f"[affix-max] magicsuffix: forced max rolls (rows changed: {cr}, cells: {cc})")
 
 
 def patch_automagic_force_max_rolls(mod_root: Path, report: list[str]) -> None:
-    """Force max rolls for all automagic entries (Classic rows: version=0)."""
+    """Force max rolls for automagic entries and pin level to maxlevel when available."""
     rel = Path("data/global/excel/automagic.txt")
     p = mod_root / rel
     if not p.exists():
-        report.append(f"[affix-max] missing {rel} (skipped)")
+        report.append(f"[automagic-max] missing {rel} (skipped)")
         return
     h, rows, nl = read_tsv(p)
-    cr, cc = _force_min_equals_max(rows, h, "0")
-    write_tsv(p, h, rows)
-    report.append(f"[affix-max] automagic: forced max rolls (rows changed: {cr}, cells: {cc})")
+    cr, cc = _force_roll_pairs_max(rows, h, report_tag="automagic-max", version_value="0", skip_special_props=True)
 
-
-def patch_skills_holyshock_min_equals_max(mod_root: Path, report: list[str]) -> None:
-    """
-    Holy Shock (and variants): force MIN lightning damage to equal MAX, and keep tooltip consistent.
-
-    Why two passes?
-    - Actual added lightning damage commonly comes from passive stat pairs:
-        passivestatX=lightmindam / passivestatY=lightmaxdam
-        passivecalcX / passivecalcY
-      We copy calc(min) := calc(max).
-    - The in-game tooltip / display range often reads EMin/EMax and EMinLev*/EMaxLev* (like Holy Fire).
-      Holy Shock vanilla uses EMin=1 with empty EMinLev* which makes the displayed range huge.
-      We also copy EMax* -> EMin* for rows we patch, so tooltip matches the deterministic behavior.
-
-    Classic-safe: no Expansion-only fields are introduced; we only copy existing values.
-    """
-    rel = Path("data/global/excel/skills.txt")
-    p = mod_root / rel
-    if not p.exists():
-        report.append(f"[holyshock] missing {rel} (skipped)")
-        return
-
-    h, rows, _nl = read_tsv(p)
-    hset = set(h)
-
-    def patch_statcalc(stat_prefix: str, calc_prefix: str, max_slots: int) -> tuple[int, int]:
-        """Copy calc for mindam -> maxdam for matching lightning stat pairs within a row."""
-        if stat_prefix + "1" not in hset or calc_prefix + "1" not in hset:
-            return (0, 0)
-
-        rows_changed = 0
-        cells_changed = 0
-
+    level_key = find_column_by_name(h, "level")
+    maxlevel_key = find_column_by_name(h, "maxlevel")
+    level_rows = 0
+    level_cells = 0
+    version_key = find_column_by_name(h, "version")
+    if level_key and maxlevel_key:
         for r in rows:
-            # Build map of stat name -> slot index
-            stats = {}
-            for i in range(1, max_slots + 1):
-                sk = f"{stat_prefix}{i}"
-                sv = (r.get(sk) or "").strip().lower()
-                if sv:
-                    stats[sv] = i
-
-            # Patch any '*mindam' -> '*maxdam' pairs
-            row_changed = False
-            for stat_name, i in list(stats.items()):
-                if not stat_name.endswith("mindam"):
-                    continue
-                max_name = stat_name[:-6] + "maxdam"
-                j = stats.get(max_name)
-                if j is None:
-                    continue
-                cmax = (r.get(f"{calc_prefix}{j}") or "").strip()
-                if not cmax:
-                    continue
-                cmin_key = f"{calc_prefix}{i}"
-                if (r.get(cmin_key) or "").strip() != cmax:
-                    r[cmin_key] = cmax
-                    cells_changed += 1
-                    row_changed = True
-
-            if row_changed:
-                rows_changed += 1
-
-        return (rows_changed, cells_changed)
-
-    # Pass 1: actual damage via passive/aura calc copies
-    pr, pc = patch_statcalc("passivestat", "passivecalc", 8)
-    ar, ac = patch_statcalc("aurastat", "aurastatcalc", 6)
-
-    # Pass 2: tooltip/display consistency via EMin/EMax pairs on Holy Shock-like rows.
-    # We only apply this for rows where the passive/aura lightning mindam/maxdam pair exists (so we don't touch unrelated skills).
-    lower_to_header = {c.lower(): c for c in h}
-
-    emin_cols = [c for c in h if c.lower().startswith("emin")]
-    display_pairs = []
-    for c in emin_cols:
-        tgt = c.lower().replace("emin", "emax", 1)
-        if tgt in lower_to_header:
-            display_pairs.append((c, lower_to_header[tgt]))
-
-    dr = 0
-    dc = 0
-    if display_pairs:
-        for r in rows:
-            # Detect lightning passive or aura pair in this row
-            has_pair = False
-            for prefix in ("passivestat", "aurastat"):
-                for i in range(1, 9 if prefix=="passivestat" else 7):
-                    s = (r.get(f"{prefix}{i}") or "").strip().lower()
-                    if s == "lightmindam":
-                        # check if any slot contains lightmaxdam
-                        for j in range(1, 9 if prefix=="passivestat" else 7):
-                            if (r.get(f"{prefix}{j}") or "").strip().lower() == "lightmaxdam":
-                                has_pair = True
-                                break
-                    if has_pair:
-                        break
-                if has_pair:
-                    break
-            if not has_pair:
+            if version_key and (r.get(version_key) or "").strip() != "0":
                 continue
+            mx = (r.get(maxlevel_key) or "").strip()
+            if mx and (r.get(level_key) or "").strip() != mx:
+                r[level_key] = mx
+                level_rows += 1
+                level_cells += 1
 
-            row_changed = False
-            for emin, emax in display_pairs:
-                mv = (r.get(emax) or "").strip()
-                if not mv:
-                    continue
-                if (r.get(emin) or "").strip() != mv:
-                    r[emin] = mv
-                    dc += 1
-                    row_changed = True
-            if row_changed:
-                dr += 1
+    total_cells = cc + level_cells
+    if total_cells:
+        write_tsv(p, h, rows, nl)
+    report.append(
+        f"[automagic-max] forced max rolls (rows changed: {cr}, cells: {cc}); "
+        f"level=maxlevel rows={level_rows}, cells={level_cells}"
+    )
 
-    write_tsv(p, h, rows)
-    report.append(f"[holyshock] min=max applied: passive(rows={pr},cells={pc}) aura(rows={ar},cells={ac}) display(rows={dr},cells={dc})")
+
+def apply_all_item_rolls_max(mod_root: Path, report: list[str]) -> None:
+    """Canon max-roll suite: uniques, sets, automagic, magic prefixes, and magic suffixes."""
+    patch_uniqueitems_force_max_rolls(mod_root, report)
+    verify_and_enforce_unique_max_rolls(mod_root, report)
+    patch_setitems_force_max_rolls(mod_root, report)
+    patch_automagic_force_max_rolls(mod_root, report)
+    patch_magicprefix_force_max_rolls(mod_root, report)
+    patch_magicsuffix_force_max_rolls(mod_root, report)
+    report.append("[item-rolls] COMPLETE: unique/set/automagic/magicprefix/magicsuffix rolls forced to max where schema-safe")
 
 def patch_misc_toa_version0(mod_root: Path, report: list[str]) -> None:
     """
@@ -900,7 +997,6 @@ def patch_showlevel(root: Path, rel: str, report: list[str]):
     report.append(f"{rel}: set ShowLevel=1 (rows changed: {rc})")
 
 
-
 def apply_qol_baseline(mod_root: Path, patch_sources: Path, report: list[str]):
     """Stage-0 QoL baseline. Must always apply (independent of Stage-1 harness/ports)."""
     # Cube QoL (unsocket/respec/cow portal/etc.)
@@ -923,70 +1019,6 @@ def apply_qol_baseline(mod_root: Path, patch_sources: Path, report: list[str]):
     patch_skills_intown_from_reference(mod_root, patch_sources, report)
 
     report.append("[qol-stage0] APPLIED: cubemain + andariel + toa + stacks + showlevel + intown")
-
-def patch_automagic(root: Path, report: list[str]):
-    p = root/"data/global/excel/automagic.txt"
-    h, d, nl = read_tsv(p)
-    rows_changed = 0
-    cells_changed = 0
-    for r in d:
-        row_changed = False
-        maxlevel = (r.get("maxlevel","") or "").strip()
-        if maxlevel and "level" in h and (r.get("level","") or "").strip() != maxlevel:
-            r["level"] = maxlevel
-            cells_changed += 1
-            row_changed = True
-        for i in range(1, 4):
-            minc, maxc = f"mod{i}min", f"mod{i}max"
-            if minc in h and maxc in h:
-                mx = (r.get(maxc,"") or "").strip()
-                if mx and (r.get(minc,"") or "").strip() != mx:
-                    r[minc] = mx
-                    cells_changed += 1
-                    row_changed = True
-        if row_changed:
-            rows_changed += 1
-    write_tsv(p, h, d, nl)
-    report.append(f"automagic.txt: level=maxlevel and modNmin=modNmax (rows changed: {rows_changed}, cells changed: {cells_changed})")
-
-def patch_setitems(root: Path, report: list[str]):
-    p = root/"data/global/excel/setitems.txt"
-    h, d, nl = read_tsv(p)
-    min_cols = [c for c in h if re.fullmatch(r"min\d+", c)]
-    amin_cols = [c for c in h if c.startswith("amin")]
-    rows_changed = 0
-    cells_changed = 0
-    for r in d:
-        row_changed = False
-        for c in min_cols:
-            mx = c.replace("min", "max", 1)
-            if mx in h:
-                mxv = (r.get(mx,"") or "").strip()
-                if mxv and (r.get(c,"") or "").strip() != mxv:
-                    r[c] = mxv
-                    cells_changed += 1
-                    row_changed = True
-        for c in amin_cols:
-            mx = c.replace("amin", "amax", 1)
-            if mx in h:
-                mxv = (r.get(mx,"") or "").strip()
-                if mxv and (r.get(c,"") or "").strip() != mxv:
-                    r[c] = mxv
-                    cells_changed += 1
-                    row_changed = True
-        if row_changed:
-            rows_changed += 1
-    write_tsv(p, h, d, nl)
-    report.append(f"setitems.txt: min->max and amin->amax (rows changed: {rows_changed}, cells changed: {cells_changed})")
-
-def cube_sig(r: dict, cols: list[str]) -> str:
-    inputs = []
-    for k in cols:
-        if k.startswith("input ") and (r.get(k,"") or "").strip():
-            inputs.append((r.get(k,"") or "").strip())
-    inputs_sorted = "|".join(sorted(inputs))
-    s = f"{r.get('op','')}|{r.get('version','')}|{r.get('output','')}|{inputs_sorted}"
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 
 def patch_cubemain(root: Path, patch_sources: Path, report: list[str]) -> None:
@@ -1108,9 +1140,14 @@ def patch_cubemain(root: Path, patch_sources: Path, report: list[str]) -> None:
         report.append(f"[cubemain-validate] WARNING: validation failed: {e}")
 
 
+
 def copy_ui_overrides(root: Path, patch_sources: Path, report: list[str], enable_ui: bool = False):
-    # UI override files (D2R layouts). If enable_ui is False (default), we still copy the
-    # override sources but then rename them to 'disable*' filenames so the game won't load them.
+    """Restore R200 UITOGGLE support for D2R layout overrides.
+
+    UITOGGLE=1 copies the active layout JSON files from patch_sources.
+    UITOGGLE=0 keeps the files present but renamed to disable* so the game will not load them.
+    This mirrors the old batch-era behavior without requiring command-line flags.
+    """
     rels = [
         "data/global/ui/layouts/_profilehd.json",
         "data/global/ui/layouts/_profilelv.json",
@@ -1129,32 +1166,38 @@ def copy_ui_overrides(root: Path, patch_sources: Path, report: list[str], enable
 
     copied = 0
     disabled = 0
+    missing = 0
 
     for rel in rels:
         src_path = patch_sources / rel
         if not src_path.exists():
+            missing += 1
             continue
 
         dst_path = root / rel
         dst_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Remove stale active/disabled counterparts before writing the requested state.
+        disabled_name = disabled_name_map.get(dst_path.name)
+        if disabled_name:
+            disabled_path = dst_path.with_name(disabled_name)
+            if disabled_path.exists():
+                disabled_path.unlink()
+        if dst_path.exists():
+            dst_path.unlink()
+
         shutil.copy2(src_path, dst_path)
         copied += 1
 
-        if not enable_ui:
-            # Rename to disabled filename in the same folder (removes active override by default).
-            new_name = disabled_name_map.get(dst_path.name)
-            if new_name:
-                disabled_path = dst_path.with_name(new_name)
-                if disabled_path.exists():
-                    disabled_path.unlink()
-                dst_path.rename(disabled_path)
-                disabled += 1
+        if not enable_ui and disabled_name:
+            disabled_path = dst_path.with_name(disabled_name)
+            dst_path.rename(disabled_path)
+            disabled += 1
 
     if enable_ui:
-        report.append(f"[ui] UI overrides enabled: copied {copied} layout json file(s) from patch_sources.")
+        report.append(f"[ui] UITOGGLE=1: UI overrides enabled; copied {copied} layout json file(s) from patch_sources (missing={missing}).")
     else:
-        report.append(f"[ui] UI overrides disabled by default: copied {copied} file(s) then renamed {disabled} to disable* filenames.")
-
+        report.append(f"[ui] UITOGGLE=0: UI overrides disabled; copied {copied} file(s) then renamed {disabled} to disable* filenames (missing={missing}).")
 
 def find_mod_subroot(static_root: Path) -> Path:
     """
@@ -1213,72 +1256,6 @@ def copy_static_payload(static_root: Path, out_root: Path, mod_subroot: Path, lo
         dst.write_bytes(p.read_bytes())
     log_lines.append(f"[static] copied static_mod into output under {out_root}")
 
-
-def sync_output_to_static(out_root: Path, script_dir: Path, mod_subroot: Path, log_lines: list[str]) -> None:
-    """
-    Overwrites static_mod with the final generated mod tree so static_mod always reflects
-    the latest known-good mod structure.
-    """
-    static_root = script_dir / "static_mod"
-    purge_static_excel_txt(static_root, report)
-    guard_no_gameplay_txt_in_static_mod(static_root)
-    src = out_root / mod_subroot
-    if not src.exists():
-        raise RuntimeError(f"Cannot sync: output mod root does not exist: {src}")
-
-    dst = static_root / mod_subroot
-    if dst.exists():
-        shutil.rmtree(dst)
-    dst.mkdir(parents=True, exist_ok=True)
-
-    copied = 0
-    for p in src.rglob("*"):
-        if not p.is_file():
-            continue
-        rel = p.relative_to(src)
-        target = dst / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(p.read_bytes())
-        copied += 1
-
-    log_lines.append(f"[sync] static_mod overwritten with {copied} files from output")
-
-
-def verify_vanilla_item_name_key(vanilla_root: Path, key: str, report: list[str]) -> None:
-    """Verify shipped vanilla item-names*.json contains a Key. Does NOT copy or modify strings.
-
-    If this verifies TRUE but you still see 'An Evil Force' in-game, your mod output is overriding
-    vanilla strings with an incomplete strings file (merge/load-order issue).
-    """
-    rel_paths = [
-        Path("data/local/lng/strings/item-names.json"),
-        Path("data/local/lng/strings/item-names-hd.json"),
-    ]
-    verified_any = False
-
-    for rel in rel_paths:
-        p = vanilla_root / rel
-        if not p.exists():
-            report.append(f"[strings] vanilla missing: {rel.as_posix()} (cannot verify)")
-            continue
-
-        raw = p.read_text(encoding="utf-8", errors="replace")
-        if f'"Key": "{key}"' in raw or f'"Key":"{key}"' in raw:
-            report.append(f"[strings] vanilla contains Key='{key}' in {rel.as_posix()}")
-            verified_any = True
-            continue
-
-        try:
-            arr = json.loads(raw)
-            keys = [e.get("Key") for e in arr if isinstance(e, dict) and isinstance(e.get("Key"), str)]
-            close = [k for k in keys if k and (key.lower().replace(' ', '') in k.lower().replace(' ', '') or k.lower().replace(' ', '') in key.lower().replace(' ', ''))]
-            report.append(f"[strings] vanilla does NOT contain Key='{key}' in {rel.as_posix()} (close: {close[:5]})")
-        except Exception as ex:
-            report.append(f"[strings] failed to parse vanilla {rel.as_posix()} for verification: {ex}")
-
-    if not verified_any:
-        report.append(f"[strings] WARNING: Could not verify vanilla Key='{key}' in any item-names*.json")
-
 def apply_remove_unique_level_requirements(mod_root, report):
     """Remove level requirements for ALL Classic uniques (uniqueitems.txt).
 
@@ -1332,58 +1309,84 @@ def apply_remove_unique_level_requirements(mod_root, report):
     return True
 
 
-
-
-
 def apply_remove_set_level_requirements(mod_root, report):
-    """Remove level requirements for ALL Classic sets (setitems.txt).
+    """Remove level requirements for set items in setitems.txt.
 
-    Sets lvlreq (aka "lvl req") to 0 for every Classic-enabled set row (version==0 or blank).
-    This does not touch base item requirements (armor/weapons), only the set item's required level.
+    D2R setitems.txt schemas vary by dump/version. Some have a Version column, some do not;
+    some spell the requirement column as "lvl req" or "*lvl req". The old cleanup build was
+    too strict and skipped the table when either Version or the exact lvlreq spelling was absent.
+
+    Canon behavior:
+    - If a version column exists, patch Classic-enabled rows only (blank or 0).
+    - If no version column exists, treat all set item rows as eligible, matching the Classic mod output table.
+    - Patch only the set item's level requirement column; do not touch base armor/weapon requirements.
     """
     p = mod_root / "data/global/excel/setitems.txt"
     if not p.exists():
         report.append("[set-lvlreq] setitems.txt not found; skipping")
         return False
 
-    h, rows, _ = read_tsv(p)
+    h, rows, nl = read_tsv(p)
 
     def norm_key(k):
-        return (k or "").strip().lstrip("\ufeff").lower().replace(" ", "")
+        # Accept schema/comment variants: "lvl req", "*lvl req", "Level Req", "req_level", etc.
+        return re.sub(r"[^a-z0-9]", "", (k or "").strip().lstrip("\ufeff").lstrip("*#").lower())
 
-    def pick(*names):
-        wanted = set(names)
+    def pick_exact(*names):
+        wanted = {norm_key(n) for n in names}
         for k in h:
             if norm_key(k) in wanted:
                 return k
         return None
 
-    ver_key = pick("version")
-    req_key = pick("lvlreq", "levelreq", "reqlevel", "reqlvl", "lvlreq", "lvlreq", "lvl req")
+    ver_key = pick_exact("version")
+    req_key = pick_exact(
+        "lvlreq", "lvl req", "levelreq", "level req", "requiredlevel", "required level",
+        "reqlevel", "req level", "reqlvl", "req lvl", "levelrequirement", "level requirement"
+    )
 
-    if ver_key is None or req_key is None:
-        report.append("[set-lvlreq] setitems missing required columns (need version + lvlreq); skipping")
+    # Fallback: choose a header that clearly contains both level/lvl and req/require.
+    if req_key is None:
+        for k in h:
+            nk = norm_key(k)
+            if ("req" in nk or "require" in nk) and ("lvl" in nk or "level" in nk):
+                req_key = k
+                break
+
+    if req_key is None:
+        sample = ", ".join(h[:24])
+        report.append(f"[set-lvlreq] setitems missing level requirement column; skipping (header sample: {sample})")
         return False
 
     def is_classic(r):
-        v = (r.get(ver_key) or "").strip()
+        if ver_key is None:
+            return True
+        v = (r.get(ver_key) or "").strip().lower()
         return v == "" or v == "0"
 
+    eligible_rows = 0
     changed_rows = 0
     for r in rows:
         if not is_classic(r):
             continue
+        eligible_rows += 1
         if (r.get(req_key) or "").strip() != "0":
             r[req_key] = "0"
             changed_rows += 1
 
-    if changed_rows == 0:
-        report.append("[set-lvlreq] No Classic set lvlreq values needed changing")
-        return True
+    if changed_rows:
+        write_tsv(p, h, rows, nl)
 
-    write_tsv(p, h, rows)
-    report.append(f"[set-lvlreq] Set lvlreq=0 for {changed_rows} Classic set row(s)")
+    ver_note = ver_key if ver_key is not None else "<none; all rows eligible>"
+    report.append(
+        f"[set-lvlreq] Set {req_key}=0 for {changed_rows} set row(s) "
+        f"(eligible={eligible_rows}, version_col={ver_note})"
+    )
     return True
+
+
+
+# === Stage-4 true expansion drop/cow farm systems restored from working branch ===
 
 def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_chaos: bool) -> None:
     """Cow-only base item sampler (deterministic TC-friendly pool builder).
@@ -1495,6 +1498,10 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
                 continue
             c = (r.get(base_k) or "").strip().lower()
             if c:
+                # Quest-only bases can appear in unique/set mappings, but R200 never allowed
+                # them into the generated cow pool.
+                if is_r200_blocked_base(c):
+                    continue
                 forge_enabled_base_codes.add(c)
                 n += 1
 
@@ -1531,6 +1538,8 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
                     continue
             t1 = (r.get(type_k) or "").strip()
             t2 = (r.get(type2_k) or "").strip()
+            if is_r200_blocked_base(c, t1, t2):
+                continue
             base_codes[c] = (t1, t2)
 
     ingest_base_table(p_armor)
@@ -1611,6 +1620,13 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
         report.append(f"[cow-all-bases] allowlist check failed (ignored): {e}")
 
     
+    # R200 safety: exclude quest-only / quest-bound bases from the mixed cow pool.
+    before_quest = len(all_codes)
+    all_codes = [c for c in all_codes if not is_r200_blocked_base(c, *base_codes.get(c, ("", "")))]
+    removed_quest = before_quest - len(all_codes)
+    if removed_quest:
+        report.append(f"[cow-all-bases] filtered {removed_quest} quest/restricted base code(s) from mixed pool")
+
     # Extra safety: exclude classic-unsafe misc categories even if they have unique/set mappings (e.g., charms, runes, jewels).
     # These can crash Classic when enabled via expansion drops.
     banned_types = {"jewl", "jewel", "charm", "rune"}
@@ -1665,21 +1681,10 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
         tc_rows.append(make_tc_row(root, current, probs))
         return root
 
-    # Build tier roots using randomized pool partitioning to avoid runtime TC blow-ups.
-    # We shuffle codes per tier using a run-seed (logged) so pools are randomized per patch build.
-    try:
-        seed_env = os.environ.get("COW_ALLBASES_SEED", "").strip()
-        if seed_env:
-            cow_seed = int(seed_env)
-        else:
-            cow_seed = int(time.time()) & 0x7fffffff
-    except Exception:
-        cow_seed = int(time.time()) & 0x7fffffff
-
-    try:
-        pool_size = int(os.environ.get("COW_ALLBASES_POOL_SIZE", "45"))
-    except Exception:
-        pool_size = 45
+    # Build tier roots using deterministic pool partitioning to keep canon output reproducible.
+    # The previous working Stage4 run logged seed=1782137524; this is now baked as canon.
+    cow_seed = int(CANON_COW_ALLBASES_SEED)
+    pool_size = int(CANON_COW_ALLBASES_POOL_SIZE)
     if pool_size < max_slots:
         pool_size = max_slots
     if pool_size > 200:
@@ -1712,7 +1717,7 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
         roots[tag] = build_tc_tree(f"zz_cow_allbases_{tag}_poolsel", pool_roots)
 
     report.append(
-        f"[cow-all-bases] Pools randomized: seed={cow_seed} pool_size={pool_size} "
+        f"[cow-all-bases] Pools deterministic: seed={cow_seed} pool_size={pool_size} "
         f"pools={{norm:{pools_per_tier.get('norm',0)} excep:{pools_per_tier.get('excep',0)} elite:{pools_per_tier.get('elite',0)}}}"
     )
 
@@ -1730,84 +1735,411 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
         tc_rows.append(make_tc_row(wname, items, probs))
         return wname
 
-    if full_chaos:
-        wN = wNM = wH = (1,1,1)
+    def build_tc_tree_weighted(prefix: str, child_names: list[str], child_weights: list[int]) -> str:
+        """Build a TC tree that preserves equal probability per leaf item.
+
+        Each child weight is the number of base codes beneath that child. This avoids the
+        old tier/pool-selection bias where smaller pools or smaller tiers could become
+        overrepresented.
+        """
+        current = list(zip(child_names, child_weights))
+        level = 1
+        while len(current) > max_slots:
+            new_current = []
+            for i in range(0, len(current), max_slots):
+                group = current[i:i+max_slots]
+                names = [n for n, _w in group]
+                weights = [max(1, int(_w)) for _n, _w in group]
+                nname = unique_name(f"{prefix}_node{level}_{(i//max_slots)+1}")
+                tc_rows.append(make_tc_row(nname, names, weights))
+                new_current.append((nname, sum(weights)))
+            current = new_current
+            level += 1
+        root = unique_name(f"{prefix}_root")
+        tc_rows.append(make_tc_row(root, [n for n, _w in current], [max(1, int(_w)) for _n, _w in current]))
+        return root
+
+    def build_flat_mixed_wrapper() -> str:
+        # One deterministic, fully mixed pool over all eligible base codes.
+        # This makes Normal/Nightmare/Hell cows pull from the exact same source, and every
+        # eligible base code receives equal weight regardless of normal/exceptional/elite tier.
+        flat_codes = all_codes[:]
+        random.Random(cow_seed).shuffle(flat_codes)
+        chunk_names = []
+        chunk_weights = []
+        for i in range(0, len(flat_codes), max_slots):
+            chunk = flat_codes[i:i+max_slots]
+            cname = unique_name(f"zz_cow_allbases_flat_{(i//max_slots)+1}")
+            tc_rows.append(make_tc_row(cname, chunk, [1] * len(chunk)))
+            chunk_names.append(cname)
+            chunk_weights.append(len(chunk))
+        root = build_tc_tree_weighted("zz_cow_allbases_flat_poolsel", chunk_names, chunk_weights)
+        wname = unique_name("zz_cow_allbases_wrap_FLAT")
+        tc_rows.append(make_tc_row(wname, [root], [1]))
+        return wname
+
+    if CANON_COW_FLAT_MIXED_POOL:
+        flat_wrap = build_flat_mixed_wrapper()
+        wrap_N = wrap_NM = wrap_H = flat_wrap
+        report.append("[cow-all-bases] FLAT MIXED POOL: every eligible base code has equal weight; Normal/Nightmare/Hell cows use the same wrapper")
     else:
-        wN  = (1024, 128, 16)
-        wNM = (512, 512, 128)
-        wH  = (128, 512, 1024)
+        if full_chaos:
+            wN = wNM = wH = (1,1,1)
+        else:
+            wN  = (1024, 128, 16)
+            wNM = (512, 512, 128)
+            wH  = (128, 512, 1024)
 
-    wrap_N  = add_wrapper("zz_cow_allbases_wrap_N",  *wN)
-    wrap_NM = add_wrapper("zz_cow_allbases_wrap_NM", *wNM)
-    wrap_H  = add_wrapper("zz_cow_allbases_wrap_H",  *wH)
+        wrap_N  = add_wrapper("zz_cow_allbases_wrap_N",  *wN)
+        wrap_NM = add_wrapper("zz_cow_allbases_wrap_NM", *wNM)
+        wrap_H  = add_wrapper("zz_cow_allbases_wrap_H",  *wH)
 
-    # Patch cow rows: add one reference to wrapper based on name
+    # Patch cow rows.
+    # R200 direct pool mode intentionally overwrites cow TCs / cow monstats so cows visibly roll
+    # the deterministic full mixed all-bases pool directly instead of merely adding the pool
+    # to empty TC slots. This is not armor-focused; armor examples are just visible proof
+    # that the broader random base pool is being reached.
+    p_mon = excel / "monstats.txt"
+
+    def wrapper_for_tc_name(name: str) -> str:
+        n = (name or "").lower()
+        # D2 naming convention: unsuffixed = Normal, (N) = Nightmare, (H) = Hell.
+        if "(h)" in n or " hell" in n:
+            return wrap_H
+        if "(n)" in n or "nightmare" in n:
+            return wrap_NM
+        return wrap_N
+
+    def wrapper_for_monstats_column(col: str) -> str:
+        c = (col or "").lower()
+        # Monstats column convention mirrors TC suffixes: (N)=Nightmare, (H)=Hell, no suffix=Normal.
+        if "(h)" in c:
+            return wrap_H
+        if "(n)" in c:
+            return wrap_NM
+        return wrap_N
+
+    # Discover exact cow TC names from monstats so we also catch champ/unique/desecrated cow routes
+    # such as Act 4 Champ B / Act 4 Unique B, which do not necessarily contain the word "cow".
+    cow_tc_names: set[str] = set()
+    monstats_patched = 0
+    if p_mon.exists():
+        mh, mrows, _ = read_tsv(p_mon)
+        def _norm2(s: str) -> str:
+            return (s or "").strip().lstrip("\ufeff").lower().replace(" ", "")
+        id_col = next((c for c in mh if _norm2(c) in ("id", "name", "monstats", "monstat")), None)
+        tc_cols = [c for c in mh if _norm2(c).startswith("treasureclass")]
+        if id_col and tc_cols:
+            for mr in mrows:
+                mid = (mr.get(id_col) or "").strip().lower()
+                if mid not in ("hellbovine", "cowking"):
+                    continue
+                for c in tc_cols:
+                    v = (mr.get(c) or "").strip()
+                    if v:
+                        cow_tc_names.add(v)
+                if CANON_COW_DIRECT_POOL:
+                    for c in tc_cols:
+                        mr[c] = wrapper_for_monstats_column(c)
+                    monstats_patched += 1
+            if CANON_COW_DIRECT_POOL and monstats_patched:
+                write_tsv(p_mon, mh, mrows)
+
     cow_rows = []
     for _r in tc_rows:
-        _name = (_r.get(tc_key) or "")
+        _name = (_r.get(tc_key) or "").strip()
         _nl = _name.lower()
-        # Only patch ORIGINAL cow TCs. Exclude any zz_* helper TCs we just created to avoid self-references.
-        if "cow" not in _nl:
-            continue
+        # Only patch ORIGINAL cow-related TCs. Exclude zz_* helper TCs to avoid self-references.
         if _nl.startswith("zz_") or "zz_cow_allbases" in _nl:
             continue
-        cow_rows.append(_r)
-    if not cow_rows:
+        if _name in cow_tc_names or "cow" in _nl:
+            cow_rows.append(_r)
+
+    if not cow_rows and not (CANON_COW_DIRECT_POOL and monstats_patched):
         report.append("[cow-all-bases] No Cow TCs found; skipped")
         return
 
-    def cow_diff(name: str) -> str:
-        n = (name or "").lower()
-        if "(h)" in n or " hell" in n:
-            return "H"
-        if "(nm)" in n or "nightmare" in n:
-            return "NM"
-        if "(n)" in n or " normal" in n:
-            return "N"
-        # fallback: use TC level if present
-        if level_key:
-            try:
-                lvl = int((name_row.get(level_key) or "0").strip() or "0")
-            except:
-                lvl = 0
-        return "H" if ("(h)" in n) else "N"
-
-
-    # Wrapper prob can be overridden for stability testing (env var).
-    try:
-        wrap_prob = int(os.environ.get("COW_ALLBASES_WRAP_PROB", "8192"))
-    except:
-        wrap_prob = 8192
+    wrap_prob = int(CANON_COW_ALLBASES_WRAP_PROB)
     if wrap_prob < 1: wrap_prob = 1
     if wrap_prob > 32767: wrap_prob = 32767
+
     injected = 0
+    direct_rows = 0
     for r in cow_rows:
         name = (r.get(tc_key) or "")
-        n = name.lower()
-        # choose wrapper by name markers
-        wrapper = wrap_H
-        if "(n)" in n or " normal" in n:
-            wrapper = wrap_N
-        elif "(nm)" in n or "nightmare" in n:
-            wrapper = wrap_NM
-        elif "(h)" in n or " hell" in n:
-            wrapper = wrap_H
-        # place into first empty slot
-        for ic, pc in zip(item_cols, prob_cols):
-            if (r.get(ic) or "").strip() != "":
-                continue
-            r[ic] = wrapper
-            r[pc] = str(wrap_prob)
+        wrapper = wrapper_for_tc_name(name)
+
+        if CANON_COW_DIRECT_POOL:
+            # Direct mode: cows roll the all-bases wrapper directly. Clear old slots so vanilla TC weights
+            # cannot drown out the random pool.
+            if picks_key: r[picks_key] = "1"
+            if nodrop_key: r[nodrop_key] = "0"
+            for ic, pc in zip(item_cols, prob_cols):
+                r[ic] = ""
+                r[pc] = "0"
+            r[item_cols[0]] = wrapper
+            r[prob_cols[0]] = "1"
             injected += 1
-            break
+            direct_rows += 1
+        else:
+            # Additive mode: place wrapper into first empty slot only.
+            for ic, pc in zip(item_cols, prob_cols):
+                if (r.get(ic) or "").strip() != "":
+                    continue
+                r[ic] = wrapper
+                r[pc] = str(wrap_prob)
+                injected += 1
+                break
 
     write_tsv(p_tc, th, tc_rows)
 
+    pool_preview = ",".join(all_codes[:40]) + ("..." if len(all_codes) > 40 else "")
     report.append(f"[cow-all-bases] {'FULL CHAOS' if full_chaos else 'Scaled'}: codes={len(all_codes)} (norm={len(normal_codes)} excep={len(excep_codes)} elite={len(elite_codes)})")
-    report.append(f"[cow-all-bases] Added TC rows: {len(tc_rows)-orig_tc_len} new row(s); cow rows patched={injected} (wrapper prob={wrap_prob}; empty-slot only)")
-    report.append(f"[cow-all-bases] Wrappers: N={wrap_N} NM={wrap_NM} H={wrap_H}")
+    report.append(
+        f"[cow-all-bases] Added TC rows: {len(tc_rows)-orig_tc_len} new row(s); "
+        f"cow rows patched={injected} mode={'direct' if CANON_COW_DIRECT_POOL else 'empty-slot'} "
+        f"(wrapper prob={wrap_prob}; monstats_patched={monstats_patched})"
+    )
+    if CANON_COW_FLAT_MIXED_POOL:
+        report.append(f"[cow-all-bases] Wrapper: ALL_DIFFICULTIES={wrap_N}")
+        report.append(
+            "[cow-all-bases] Parity check: "
+            f"AncientArmor(aar)={'present' if 'aar' in set(all_codes) else 'missing'}; "
+            f"SacredArmor(uar)={'present' if 'uar' in set(all_codes) else 'missing'}; "
+            "per-code-weight=equal"
+        )
+    else:
+        report.append(f"[cow-all-bases] Wrappers: N={wrap_N} NM={wrap_NM} H={wrap_H}")
+    report.append(f"[cow-all-bases] Mixed pool preview: {pool_preview}")
 
+def apply_tc_enrichment_highlevel_bases(mod_root: Path, report: list[str], enabled: bool) -> None:
+    """TC enrichment layer (drops): integrate ported (non-Assassin/Druid) bases into natural TreasureClassEx drops.
 
+    Philosophy (SAFE MODE):
+      - Does NOT alter row count/order.
+      - Does NOT change NoDrop, Picks, quality bias, or existing Item/Prob entries.
+      - Fills EMPTY ItemN slots only, on high-level TCs (level >= 70), excluding Cow TCs.
+      - Intended to make ported bases naturally appear without destabilizing Classic balance.
+
+    Notes:
+      - Uniques remain subject to the engine's per-game unique spawn rule.
+      - This integrates BASE items; actual unique/set rarity is still controlled by quality selection.
+    """
+    if not enabled:
+        report.append("[tc-enrichment] Disabled (flag off); skipped")
+        return
+
+    excel = mod_root / "data/global/excel"
+    p_tc = excel / "treasureclassex.txt"
+    p_uni = excel / "uniqueitems.txt"
+    p_armor = excel / "armor.txt"
+    p_weap = excel / "weapons.txt"
+    p_misc = excel / "misc.txt"
+    p_types = excel / "itemtypes.txt"
+
+    if not (p_tc.exists() and p_uni.exists() and p_types.exists()):
+        report.append("[tc-enrichment] Missing treasureclassex/uniqueitems/itemtypes; skipped")
+        return
+
+    th, tc_rows, _ = read_tsv(p_tc)
+    uh, urows, _ = read_tsv(p_uni)
+    hh, type_rows, _ = read_tsv(p_types)
+
+    def normalize_column_key(k): return (k or "").strip().lstrip("\ufeff").lower().replace(" ", "")
+
+    tc_key = next((k for k in th if normalize_column_key(k) in ("treasureclass","treasureclassname","name","tc")), None)
+    lvl_key = next((k for k in th if normalize_column_key(k) in ("level","lvl","tclevel")), None)
+
+    item_cols = [k for k in th if normalize_column_key(k).startswith("item")]
+    prob_cols = [k for k in th if normalize_column_key(k).startswith("prob")]
+
+    def _suffix_num(col):
+        m = re.search(r'(\d+)$', normalize_column_key(col))
+        return int(m.group(1)) if m else 0
+
+    item_cols.sort(key=_suffix_num)
+    prob_cols.sort(key=_suffix_num)
+
+    if not tc_key or not lvl_key or not item_cols or not prob_cols:
+        report.append("[tc-enrichment] treasureclassex missing expected columns; skipped")
+        return
+
+    # Build base code -> (table, row_index, type/type2) index from armor/weapons/misc
+    base_index = {}
+    base_tables = {}
+    def index_base_table(p: Path):
+        if not p.exists():
+            return
+        h, rows, _ = read_tsv(p)
+        col_code = find_column_by_name(h, "code")
+        col_type = find_column_by_name(h, "type")
+        col_type2 = find_column_by_name(h, "type2")
+        if not col_code:
+            return
+        base_tables[p.name] = (p, h, rows, col_code, col_type, col_type2)
+        for i, r in enumerate(rows):
+            c = (r.get(col_code) or "").strip().lower()
+            if not c:
+                continue
+            if c not in base_index:
+                base_index[c] = (p.name, i)
+
+    index_base_table(p_armor)
+    index_base_table(p_weap)
+    index_base_table(p_misc)
+
+    # Identify Assassin/Druid restricted item type codes from itemtypes.txt
+    col_type_code = next((k for k in hh if normalize_column_key(k) in ("code","itemtype","type","itemtypecode")), None)
+    col_class = next((k for k in hh if normalize_column_key(k) in ("class","equiv1","playerclass")), None)
+    # In most schemas, 'Class' exists; if not, we fall back to skipping nothing (but Classic port layer already excluded those uniques).
+    restricted_type_codes = set()
+    if col_type_code and col_class:
+        for r in type_rows:
+            cls = (r.get(col_class) or "").strip().lower()
+            if cls in ("ass", "dru"):
+                restricted_type_codes.add((r.get(col_type_code) or "").strip())
+
+    def is_restricted_base(code_item: str) -> bool:
+        code_item = (code_item or "").strip().lower()
+        if code_item not in base_index:
+            return False
+        fname, ridx = base_index[code_item]
+        p, h, rows, col_code, col_type, col_type2 = base_tables[fname]
+        br = rows[ridx]
+        t1 = (br.get(col_type) or "").strip()
+        t2 = (br.get(col_type2) or "").strip()
+        return (t1 in restricted_type_codes) or (t2 in restricted_type_codes)
+
+    # Collect eligible base codes from Classic-enabled uniques (exclude ass/dru locked bases)
+    ver_key = find_column_by_name(uh, "version")
+    code_key = find_column_by_name(uh, "code")
+    en_key = next((k for k in uh if normalize_column_key(k) in ("enabled","enabled1")), None)
+
+    if not ver_key or not code_key:
+        report.append("[tc-enrichment] uniqueitems missing version/code; skipped")
+        return
+
+    eligible = []
+    seen = set()
+    for r in urows:
+        v = (r.get(ver_key) or "").strip()
+        if v not in ("", "0"):
+            continue
+        if en_key:
+            ev = (r.get(en_key) or "").strip()
+            if ev not in ("", "1"):
+                continue
+        c = (r.get(code_key) or "").strip().lower()
+        if not c or c in seen:
+            continue
+        if is_r200_blocked_base(c):
+            continue
+        if is_restricted_base(c):
+            continue
+        seen.add(c)
+        eligible.append(c)
+
+    if not eligible:
+        report.append("[tc-enrichment] No eligible base codes found; skipped")
+        return
+
+    # Exclude classic-unsafe misc categories even if Classic-enabled (e.g., unique jewel rows).
+    banned_misc_types = {"jewl", "jewel", "charm", "rune"}
+
+    # Stage-1 stable Classic port allowlist:
+    # Only port expansion uniques/sets whose *base item type* is known stable under the harness.
+    # Explicitly exclude problematic categories (jave, thro) and non-ports (hamm, club) plus gems/jewels/runes/charms.
+    stable_type_codes = STAGE1_STABLE_TYPE_CODES
+    excluded_type_codes = STAGE1_EXCLUDED_TYPE_CODES
+    before_unsafe = len(eligible)
+    eligible2 = []
+    for c in eligible:
+        if is_restricted_base(c):
+            continue
+        bi = base_index.get(c)
+        if not bi:
+            continue
+        tname, ridx = bi
+        _p, _h, rows_b, _col_code, col_type, col_type2 = base_tables[tname]
+        br = rows_b[ridx]
+        t1 = (br.get(col_type) or "").strip().lower() if col_type else ""
+        t2 = (br.get(col_type2) or "").strip().lower() if col_type2 else ""
+        if is_r200_blocked_base(c, t1, t2):
+            continue
+        if t1 in banned_misc_types or t2 in banned_misc_types:
+            continue
+        eligible2.append(c)
+    eligible = eligible2
+    removed_unsafe = before_unsafe - len(eligible)
+    if removed_unsafe:
+        report.append(f"[tc-enrichment] filtered {removed_unsafe} classic-unsafe base code(s) by type (banned={sorted(banned_misc_types)})")
+
+    # Deterministic shuffle
+    rng = random.Random(20260221)
+    eligible_sorted = sorted(eligible)
+    rng.shuffle(eligible_sorted)
+
+    # Inject into high-level TCs only, empty slots only.
+    # Branch canon uses flat/no-focus enrichment. Older R200 experiments front-loaded
+    # uar/uap/etc. with higher probability, which made Sacred Armor visibly overrepresented
+    # compared with normal-tier bases like Ancient Armor. Keep everything schema-safe but
+    # avoid any hand-picked focus boost.
+    MIN_LEVEL = 70
+    MAX_PER_TC = 2
+    PROB = "1"      # conservative equal weight comparable to existing high-level probs
+    PROB_FOCUS = "1"
+
+    if CANON_TC_ENRICHMENT_FLAT_NO_FOCUS:
+        focus = []
+        stream = eligible_sorted[:]
+    else:
+        focus = [c for c in ["uar","uap","9wd","xap","ring","amul"] if c in set(eligible_sorted) or c in ("ring","amul")]
+        stream = focus + [c for c in eligible_sorted if c not in set(focus)]
+
+    injected = 0
+    tcs_touched = 0
+    i = 0
+
+    for r in tc_rows:
+        name = (r.get(tc_key) or "")
+        if "cow" in name.lower():
+            continue
+        lvl = (r.get(lvl_key) or "").strip()
+        if not lvl.isdigit() or int(lvl) < MIN_LEVEL:
+            continue
+
+        placed = 0
+        for ic, pc in zip(item_cols, prob_cols):
+            if placed >= MAX_PER_TC:
+                break
+            if (r.get(ic) or "").strip() != "":
+                continue
+            if i >= len(stream):
+                break
+            r[ic] = stream[i]
+            r[pc] = PROB_FOCUS if stream[i] in focus else PROB
+            i += 1
+            placed += 1
+            injected += 1
+
+        if placed:
+            tcs_touched += 1
+        if i >= len(stream):
+            break
+
+    if injected:
+        write_tsv(p_tc, th, tc_rows)
+        report.append(f"[tc-enrichment] SAFE injected {injected} base entries into {tcs_touched} high-level TCs (level>={MIN_LEVEL}, empty slots only, prob={PROB}).")
+        if CANON_TC_ENRICHMENT_FLAT_NO_FOCUS:
+            report.append("[tc-enrichment] FLAT NO-FOCUS: no hand-picked focus bases; all injected base entries use equal prob=1")
+        else:
+            report.append(f"[tc-enrichment] Focus: {','.join(focus) if focus else '(none)'}")
+        preview = ",".join(stream[:40]) + ("..." if len(stream)>40 else "")
+        report.append(f"[tc-enrichment] Stream preview: {preview}")
+    else:
+        report.append("[tc-enrichment] No empty slots found on eligible TCs; no changes made.")
+
+# === End restored Stage-4 systems ===
 
 def apply_no_low_quality_items(mod_root, report, enabled: bool):
     """Stage 0 (optional): Disable low-quality (cracked/crude/damaged) item drops.
@@ -1965,283 +2297,6 @@ def apply_cow_always_drop(mod_root: Path, report: list[str], enabled: bool) -> N
     write_tsv(p_tc, th_tc, tc_rows, newline=tc_nl)
     report.append(f"[stage4-cow] Patched {patched} cow TreasureClassEx row(s) (NoDrop=0)")
 
-
-def apply_tc_enrichment_highlevel_bases(mod_root: Path, report: list[str], enabled: bool) -> None:
-    """TC enrichment layer (drops): integrate ported (non-Assassin/Druid) bases into natural TreasureClassEx drops.
-
-    Philosophy (SAFE MODE):
-      - Does NOT alter row count/order.
-      - Does NOT change NoDrop, Picks, quality bias, or existing Item/Prob entries.
-      - Fills EMPTY ItemN slots only, on high-level TCs (level >= 70), excluding Cow TCs.
-      - Intended to make ported bases naturally appear without destabilizing Classic balance.
-
-    Notes:
-      - Uniques remain subject to the engine's per-game unique spawn rule.
-      - This integrates BASE items; actual unique/set rarity is still controlled by quality selection.
-    """
-    if not enabled:
-        report.append("[tc-enrichment] Disabled (flag off); skipped")
-        return
-
-    excel = mod_root / "data/global/excel"
-    p_tc = excel / "treasureclassex.txt"
-    p_uni = excel / "uniqueitems.txt"
-    p_armor = excel / "armor.txt"
-    p_weap = excel / "weapons.txt"
-    p_misc = excel / "misc.txt"
-    p_types = excel / "itemtypes.txt"
-
-    if not (p_tc.exists() and p_uni.exists() and p_types.exists()):
-        report.append("[tc-enrichment] Missing treasureclassex/uniqueitems/itemtypes; skipped")
-        return
-
-    th, tc_rows, _ = read_tsv(p_tc)
-    uh, urows, _ = read_tsv(p_uni)
-    hh, type_rows, _ = read_tsv(p_types)
-
-    def normalize_column_key(k): return (k or "").strip().lstrip("\ufeff").lower().replace(" ", "")
-
-    tc_key = next((k for k in th if normalize_column_key(k) in ("treasureclass","treasureclassname","name","tc")), None)
-    lvl_key = next((k for k in th if normalize_column_key(k) in ("level","lvl","tclevel")), None)
-
-    item_cols = [k for k in th if normalize_column_key(k).startswith("item")]
-    prob_cols = [k for k in th if normalize_column_key(k).startswith("prob")]
-
-    def _suffix_num(col):
-        m = re.search(r'(\d+)$', normalize_column_key(col))
-        return int(m.group(1)) if m else 0
-
-    item_cols.sort(key=_suffix_num)
-    prob_cols.sort(key=_suffix_num)
-
-    if not tc_key or not lvl_key or not item_cols or not prob_cols:
-        report.append("[tc-enrichment] treasureclassex missing expected columns; skipped")
-        return
-
-    # Build base code -> (table, row_index, type/type2) index from armor/weapons/misc
-    base_index = {}
-    base_tables = {}
-    def index_base_table(p: Path):
-        if not p.exists():
-            return
-        h, rows, _ = read_tsv(p)
-        col_code = find_column_by_name(h, "code")
-        col_type = find_column_by_name(h, "type")
-        col_type2 = find_column_by_name(h, "type2")
-        if not col_code:
-            return
-        base_tables[p.name] = (p, h, rows, col_code, col_type, col_type2)
-        for i, r in enumerate(rows):
-            c = (r.get(col_code) or "").strip().lower()
-            if not c:
-                continue
-            if c not in base_index:
-                base_index[c] = (p.name, i)
-
-    index_base_table(p_armor)
-    index_base_table(p_weap)
-    index_base_table(p_misc)
-
-    # Identify Assassin/Druid restricted item type codes from itemtypes.txt
-    col_type_code = next((k for k in hh if normalize_column_key(k) in ("code","itemtype","type","itemtypecode")), None)
-    col_class = next((k for k in hh if normalize_column_key(k) in ("class","equiv1","playerclass")), None)
-    # In most schemas, 'Class' exists; if not, we fall back to skipping nothing (but Classic port layer already excluded those uniques).
-    restricted_type_codes = set()
-    if col_type_code and col_class:
-        for r in type_rows:
-            cls = (r.get(col_class) or "").strip().lower()
-            if cls in ("ass", "dru"):
-                restricted_type_codes.add((r.get(col_type_code) or "").strip())
-
-    def is_restricted_base(code_item: str) -> bool:
-        code_item = (code_item or "").strip().lower()
-        if code_item not in base_index:
-            return False
-        fname, ridx = base_index[code_item]
-        p, h, rows, col_code, col_type, col_type2 = base_tables[fname]
-        br = rows[ridx]
-        t1 = (br.get(col_type) or "").strip()
-        t2 = (br.get(col_type2) or "").strip()
-        return (t1 in restricted_type_codes) or (t2 in restricted_type_codes)
-
-    # Collect eligible base codes from Classic-enabled uniques (exclude ass/dru locked bases)
-    ver_key = find_column_by_name(uh, "version")
-    code_key = find_column_by_name(uh, "code")
-    en_key = next((k for k in uh if normalize_column_key(k) in ("enabled","enabled1")), None)
-
-    if not ver_key or not code_key:
-        report.append("[tc-enrichment] uniqueitems missing version/code; skipped")
-        return
-
-    eligible = []
-    seen = set()
-    for r in urows:
-        v = (r.get(ver_key) or "").strip()
-        if v not in ("", "0"):
-            continue
-        if en_key:
-            ev = (r.get(en_key) or "").strip()
-            if ev not in ("", "1"):
-                continue
-        c = (r.get(code_key) or "").strip().lower()
-        if not c or c in seen:
-            continue
-        if is_restricted_base(c):
-            continue
-        seen.add(c)
-        eligible.append(c)
-
-    if not eligible:
-        report.append("[tc-enrichment] No eligible base codes found; skipped")
-        return
-
-    # Exclude classic-unsafe misc categories even if Classic-enabled (e.g., unique jewel rows).
-    banned_misc_types = {"jewl", "jewel", "charm", "rune"}
-
-    # Stage-1 stable Classic port allowlist:
-    # Only port expansion uniques/sets whose *base item type* is known stable under the harness.
-    # Explicitly exclude problematic categories (jave, thro) and non-ports (hamm, club) plus gems/jewels/runes/charms.
-    stable_type_codes = STAGE1_STABLE_TYPE_CODES
-    excluded_type_codes = STAGE1_EXCLUDED_TYPE_CODES
-    before_unsafe = len(eligible)
-    eligible2 = []
-    for c in eligible:
-        if is_restricted_base(c):
-            continue
-        bi = base_index.get(c)
-        if not bi:
-            continue
-        tname, ridx = bi
-        _p, _h, rows_b, _col_code, col_type, col_type2 = base_tables[tname]
-        br = rows_b[ridx]
-        t1 = (br.get(col_type) or "").strip().lower() if col_type else ""
-        t2 = (br.get(col_type2) or "").strip().lower() if col_type2 else ""
-        if t1 in banned_misc_types or t2 in banned_misc_types:
-            continue
-        eligible2.append(c)
-    eligible = eligible2
-    removed_unsafe = before_unsafe - len(eligible)
-    if removed_unsafe:
-        report.append(f"[tc-enrichment] filtered {removed_unsafe} classic-unsafe base code(s) by type (banned={sorted(banned_misc_types)})")
-
-    # Deterministic shuffle
-    rng = random.Random(20260221)
-    eligible_sorted = sorted(eligible)
-    rng.shuffle(eligible_sorted)
-
-    # Inject into high-level TCs only, empty slots only
-    MIN_LEVEL = 70
-    MAX_PER_TC = 2
-    PROB = "1"      # conservative weight comparable to existing high-level probs
-    PROB_FOCUS = "2"
-
-    focus = [c for c in ["uar","uap","9wd","xap","ring","amul"] if c in set(eligible_sorted) or c in ("ring","amul")]
-    stream = focus + [c for c in eligible_sorted if c not in set(focus)]
-
-    injected = 0
-    tcs_touched = 0
-    i = 0
-
-    for r in tc_rows:
-        name = (r.get(tc_key) or "")
-        if "cow" in name.lower():
-            continue
-        lvl = (r.get(lvl_key) or "").strip()
-        if not lvl.isdigit() or int(lvl) < MIN_LEVEL:
-            continue
-
-        placed = 0
-        for ic, pc in zip(item_cols, prob_cols):
-            if placed >= MAX_PER_TC:
-                break
-            if (r.get(ic) or "").strip() != "":
-                continue
-            if i >= len(stream):
-                break
-            r[ic] = stream[i]
-            r[pc] = PROB_FOCUS if stream[i] in focus else PROB
-            i += 1
-            placed += 1
-            injected += 1
-
-        if placed:
-            tcs_touched += 1
-        if i >= len(stream):
-            break
-
-    if injected:
-        write_tsv(p_tc, th, tc_rows)
-        report.append(f"[tc-enrichment] SAFE injected {injected} base entries into {tcs_touched} high-level TCs (level>={MIN_LEVEL}, empty slots only, prob={PROB}/{PROB_FOCUS}).")
-        report.append(f"[tc-enrichment] Focus: {','.join(focus) if focus else '(none)'}")
-        preview = ",".join(stream[:40]) + ("..." if len(stream)>40 else "")
-        report.append(f"[tc-enrichment] Stream preview: {preview}")
-    else:
-        report.append("[tc-enrichment] No empty slots found on eligible TCs; no changes made.")
-
-def apply_post_unique_maxrolls_for_targets(mod_root: Path, report: list[str], target_names: list[str]) -> None:
-    """
-    _validate_stage1_type_lists(report)
-    Post-pass maxroll fixer for specific unique rows (Classic-only).
-    still get min=max applied.
-    """
-    rel = Path("data/global/excel/uniqueitems.txt")
-    p = mod_root / rel
-    if not p.exists():
-        report.append(f"[uni-max-post] missing {rel} (skipped)")
-        return
-
-    h, rows, _ = read_tsv(p)
-
-    def normalize_column_key(k): return (k or "").strip().lstrip("\ufeff").lower().replace(" ", "")
-    index_key = next((k for k in h if normalize_column_key(k)=="index"), None)
-    name_key  = find_column_by_name(h, "name")
-    id_keys = [k for k in (index_key, name_key) if k]
-
-    if not id_keys:
-        report.append("[uni-max-post] uniqueitems missing index/name columns (skipped)")
-        return
-
-    targets = set([t.strip().lower() for t in target_names if t and t.strip()])
-    min_cols = [c for c in h if c.lower().startswith("min") and c[3:].isdigit()]
-    if not min_cols:
-        report.append("[uni-max-post] no min/max columns found (skipped)")
-        return
-
-    changed_cells = 0
-    changed_rows = 0
-
-    for r in rows:
-        if (r.get("version") or "").strip() != "0":
-            continue
-        # match by index or name
-        rid = ""
-        for k in id_keys:
-            v=(r.get(k) or "").strip().lower()
-            if v:
-                rid=v
-                break
-        if rid not in targets:
-            continue
-
-        row_changed=False
-        for c in min_cols:
-            mx="max"+c[3:]
-            if mx not in h:
-                continue
-            mxv=(r.get(mx,"") or "").strip()
-            if not mxv:
-                continue
-            if (r.get(c,"") or "").strip()!=mxv:
-                r[c]=mxv
-                changed_cells+=1
-                row_changed=True
-        if row_changed:
-            changed_rows+=1
-
-    if changed_rows:
-        write_tsv(p, h, rows)
-    report.append(f"[uni-max-post] targets={len(targets)} rows changed={changed_rows} cells={changed_cells}")
-
 def add_low_quality_variants_cubemain(rows, header, report):
     """
     Expand cubemain recipes so input quality variants work for cow-level forging/testing.
@@ -2310,7 +2365,6 @@ def add_low_quality_variants_cubemain(rows, header, report):
     return delta
 
 
-
 def validate_uniqueitems_invariants(mod_root, report):
     """Hard integrity gate to prevent 'jumbled uniques' caused by structural corruption.
 
@@ -2338,17 +2392,30 @@ def validate_uniqueitems_invariants(mod_root, report):
         raise RuntimeError(f"PATCHER ASSERTION FAILED: uniqueitems.txt rowcount changed (vanilla={len(vrows)} mod={len(mrows)}).")
 
     if "*ID" in mh:
-        ids = [(r.get("*ID") or "").strip() for r in mrows]
+        vanilla_ids = [(r.get("*ID") or "").strip() for r in vrows]
+        mod_ids = [(r.get("*ID") or "").strip() for r in mrows]
 
-        # Compare vanilla ordering first (empties allowed if vanilla has them)
+        if vanilla_ids != mod_ids:
+            examples = []
+            for i, (v_id, m_id) in enumerate(zip(vanilla_ids, mod_ids), start=1):
+                if v_id != m_id:
+                    examples.append((i, v_id, m_id))
+                    if len(examples) >= 10:
+                        break
+            raise RuntimeError(
+                "PATCHER ASSERTION FAILED: uniqueitems.txt *ID row order drift detected "
+                f"(examples row,vanilla,mod={examples})."
+            )
 
         # Uniqueness gate applies to non-empty IDs only (vanilla includes marker rows with empty *ID)
-        nn = [x for x in ids if x != ""]
+        nn = [x for x in mod_ids if x != ""]
         if len(set(nn)) != len(nn):
             # report first few duplicates for diagnostics
             seen = {}
             dups = []
-            for i, x in enumerate(ids, start=1):
+            for i, x in enumerate(mod_ids, start=1):
+                if not x:
+                    continue
                 if x in seen:
                     dups.append((x, seen[x], i))
                     if len(dups) >= 10:
@@ -2360,7 +2427,6 @@ def validate_uniqueitems_invariants(mod_root, report):
 
     report.append("[uniqueitems-guard] OK: header/rowcount/*ID uniqueness/order match vanilla.")
     return True
-
 
 
 def assert_no_lod_ports_when_disabled(vanilla_root: Path, mod_root: Path, report: list[str]) -> None:
@@ -2559,6 +2625,8 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
     skipped_ass_prop = 0
     skipped_dru_prop = 0
     skipped_unsafe_misc = 0
+    skipped_quest = 0
+    skipped_superseded = 0
     skipped_bases = set()
     skipped_by_prop = []  # list[(unique_index, token)]
     missing_bases = set()
@@ -2571,6 +2639,18 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
         idx = (r.get(col_u_idx) or "").strip()
         code_item = (r.get(col_u_code) or "").strip()
         if not idx or not code_item:
+            continue
+        if is_r200_superseded_unique(idx, code_item):
+            skipped_superseded += 1
+            skipped_by_prop.append((idx, "superseded"))
+            continue
+        if is_r200_superseded_base_code(code_item):
+            skipped_superseded += 1
+            skipped_by_prop.append((idx, "superseded"))
+            continue
+        if is_r200_quest_restricted_base(code_item):
+            skipped_quest += 1
+            skipped_by_prop.append((idx, "quest"))
             continue
 
         # Base lookup + stable allowlist gate (prevents Classic-unsafe ports).
@@ -2652,6 +2732,18 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
         br_b = rows_b[ridx]
         t1_b = (br_b.get(col_type_b) or "").strip().lower() if col_type_b else ""
         t2_b = (br_b.get(col_type2_b) or "").strip().lower() if col_type2_b else ""
+        if is_r200_superseded_unique(idx, code_item):
+            skipped_superseded += 1
+            skipped_by_prop.append((idx, "superseded"))
+            continue
+        if is_r200_superseded_base_code(code_item):
+            skipped_superseded += 1
+            skipped_by_prop.append((idx, "superseded"))
+            continue
+        if is_r200_quest_restricted_base(code_item, t1_b, t2_b):
+            skipped_quest += 1
+            skipped_by_prop.append((idx, "quest"))
+            continue
         if t1_b in banned_misc_types or t2_b in banned_misc_types:
             skipped_unsafe_misc += 1
             skipped_by_prop.append((idx, t1_b if t1_b in banned_misc_types else t2_b))
@@ -2718,7 +2810,7 @@ def apply_classic_unique_port_layer(mod_root: Path, report: list[str], strict: b
     for fname, (p, h, rows, col_code, col_ver, col_spawn, col_type, col_type2) in base_tables.items():
         write_tsv(p, h, rows)
 
-    report.append(f"[classic-port] enabled/ported uniques (non-ass/dru)={enabled_uniques}, base rows enabled/updated={enabled_bases}, skipped ass={skipped_ass}, skipped dru={skipped_dru}, skipped unsafe misc={skipped_unsafe_misc}")
+    report.append(f"[classic-port] enabled/ported uniques (non-ass/dru)={enabled_uniques}, base rows enabled/updated={enabled_bases}, skipped ass={skipped_ass}, skipped dru={skipped_dru}, skipped unsafe misc={skipped_unsafe_misc}, skipped quest={skipped_quest}, skipped superseded={skipped_superseded}")
     if skipped_ass_prop or skipped_dru_prop:
         report.append(f"[classic-port] skipped_by_prop: ass={skipped_ass_prop}, dru={skipped_dru_prop} (class-skill uniques on shared bases)")
         sample = ", ".join([f"{u}({t})" for (u,t) in sorted(skipped_by_prop)[:40]])
@@ -3059,7 +3151,6 @@ def patch_relax_item_requirements(mod_root: Path, report: list[str]) -> None:
     _relax_table(excel / "weapons.txt", "weap")
 
 
-
 def purge_static_excel_txt(static_root: Path, report: list[str]) -> None:
     """Remove any stray gameplay .txt under static_mod/.../data/global/excel created by prior runs."""
     if not static_root.exists():
@@ -3357,7 +3448,6 @@ def apply_stage5_stash_lodish(mod_root: Path, vanilla_root: Path, report: list[s
     report.append(f"[stage5-stash] APPLIED: generated bankoriginallayout(.hd).json from vanilla bankexpansion deltas (files={generated}, controller_files={controller_generated})")
 
 
-
 def patch_skills_flatten_holy_aura_damage(mod_root: Path, report: list[str]) -> None:
     """
     Flat-max the elemental aura pulse damage for Holy Fire / Holy Freeze / Holy Shock
@@ -3525,28 +3615,38 @@ def patch_skilldesc_holy_aura_direct_single_value(mod_root: Path, report: list[s
     report.append(f"[skilldesc-holy-direct] APPLIED: rows_changed={changed_rows} cells_changed={changed_cells} targets=holy fire,holy freeze,holy shock mode=single_true_max_no_dupe")
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--vanilla", required=True, help="Path to vanilla dump root containing data/ ...")
-    ap.add_argument("--out", required=True, help="Output folder (a complete mod tree will be created here)")
-    ap.add_argument("--cow-all-bases", action="store_true", help="Cow Level: integrate ALL base items with difficulty scaling (Normal/NM/Hell wrappers).")
-    ap.add_argument("--cow-all-bases-full", action="store_true", help="Cow Level: FULL CHAOS mode (all bases equally likely regardless of difficulty). Implies --cow-all-bases.")
-    ap.add_argument("--no-low-quality", action="store_true", help="Stage 0: Disable low-quality (cracked/crude/damaged) item drops by forcing itemratio Normal=1 NormalDivisor=1 so the engine falls back to Normal instead of Low Quality.")
-    ap.add_argument("--cow-always-drop", action="store_true", help="Stage 4: Force Hell Bovines (and Cow King) to always drop at least one item by setting NoDrop=0 for the TreasureClass rows they use.")
-    # Drop ecosystem integration (Expansion -> Classic).
-    ap.add_argument(
-        "--enable-expansion-drops-in-classic",
-        dest="enable_expansion_drops_in_classic",
-        action="store_true",
-        help="Enable Expansion (LoD) base items to drop naturally in Classic via TreasureClassEx integration (safe: fills empty slots only; no NoDrop/Picks changes).",
+    # Zero-flag canon runner.
+    # Run this file directly:
+    #     python patcher.py
+    #
+    # Expected layout beside patcher.py:
+    #     vanilla/
+    #     static_mod/
+    #     patch_sources/
+    #
+    # Output:
+    #     output/
+    #
+    # These values mirror the previous canonical batch defaults.
+    args = argparse.Namespace(
+        vanilla=str(SCRIPT_DIR / "vanilla"),
+        out=str(SCRIPT_DIR / "output"),
+        patch_sources=str(SCRIPT_DIR / "patch_sources"),
+        cow_all_bases=CANON_COWALLBASES,
+        cow_all_bases_full=(CANON_COWALLBASES and CANON_COWCHAOS),
+        enable_ui=CANON_UITOGGLE,
+        no_low_quality=CANON_NOLOWQUALITY,
+        cow_always_drop=CANON_COWALWAYSDROP,
+        enable_expansion_drops_in_classic=CANON_ENABLE_EXPANSION_DROPS_IN_CLASSIC,
+        stash_lodish=CANON_LODSTASH,
     )
-    ap.add_argument("--enable-ui", action="store_true", help="Enable UI layout json overrides (default is disabled: files are renamed to disable*).")
-    ap.add_argument("--stash-lodish", action="store_true", help="Stage 5: Generate LoD-style large stash for Classic (bankoriginal layouts + inventory bank grid).")
-    ap.add_argument("--patch-sources", default=str(Path(__file__).parent/"patch_sources"),
-                    help="Folder containing cubemain.txt and UI json overrides")
-    args = ap.parse_args()
+
+    # Force the canonical stage internally so no external flags/env are needed.
+    os.environ["EXP_DROPS_STAGE"] = str(CANON_EXP_DROPS_STAGE)
     # Canonicalize vanilla root path for Stage-1 harness pool reads
     vanilla_root = Path(args.vanilla).resolve()
     report = []
+    _validate_stage1_type_lists(report)
     # --- Stage-1 Cow Harness (env toggles) ---
     stage1_preset = ""
     _stage1_keys = [
@@ -3557,23 +3657,20 @@ def main():
         # Jewelry / misc (no runes/jewels/charms in Stage1)
         "RING", "AMUL", "GEM",
     ]
-    _stage1_on = []
-    for k in _stage1_keys:
-        if (os.environ.get("STAGE1_"+k, "0") or "0").strip() == "1":
-            _stage1_on.append(k)
+    # Canon run keeps Stage-1 harness disabled unless the constant above is changed.
+    _stage1_on = [CANON_STAGE1_PRESET] if CANON_STAGE1_PRESET else []
     if len(_stage1_on) == 1:
         stage1_preset = _stage1_on[0]
         report.append(f"[stage1-cow] env preset={stage1_preset}")
     elif len(_stage1_on) > 1:
         raise SystemExit(f"Stage-1 Cow Harness: set EXACTLY ONE STAGE1_* env toggle to 1 (got {', '.join(_stage1_on)})")
 
-    # --- Expansion Drops in Classic: staged enablement ladder (for fast crash isolation) ---
-    # If --enable-expansion-drops-in-classic is set, you can control which sub-features run via:
-    #   EXP_DROPS_STAGE=1  -> LoD port layer only
-    #   EXP_DROPS_STAGE=2  -> port + cow base farm
-    #   EXP_DROPS_STAGE=3  -> port + cow base farm + tc-enrich (unsafe / diagnostic)
-    #   EXP_DROPS_STAGE=4  -> stage 3 + chaos tuning (requires COWCHAOS etc. as usual)
-    # Default when exp-drops is enabled: stage 2 (stable, intuitive).
+    # --- Expansion Drops in Classic: staged enablement ladder ---
+    # Canon stage 4 means:
+    #   stage 1 -> LoD port layer
+    #   stage 2 -> stage 1 + cow all-bases farm
+    #   stage 3 -> stage 2 + TC enrichment
+    #   stage 4 -> stage 3 + chaos/full cow mode
     exp_stage = 0
     exp_port = False
     exp_cowfarm = False
@@ -3593,6 +3690,30 @@ def main():
 
     script_dir = Path(__file__).resolve().parent
     static_root = script_dir / "static_mod"
+
+    # Guardrail: static_mod may contain assets, but gameplay Excel .txt files must be generated
+    # from the current vanilla dump. Purge stale contamination first, then hard-fail if any remain.
+    purge_static_excel_txt(static_root, report)
+    guard_no_gameplay_txt_in_static_mod(static_root)
+
+    report.append(
+        "[canon-profile] ENABLE_EXPANSION_DROPS_IN_CLASSIC=1 "
+        f"COWALLBASES={int(args.cow_all_bases)} "
+        f"COWCHAOS={int(args.cow_all_bases_full)} "
+        f"EXP_DROPS_STAGE={exp_stage} "
+        f"UITOGGLE={int(args.enable_ui)} "
+        f"LODSTASH={int(args.stash_lodish)} "
+        f"COWALWAYSDROP={int(args.cow_always_drop)} "
+        f"NOLOWQUALITY={int(args.no_low_quality)} "
+        f"COW_ALLBASES_SEED={CANON_COW_ALLBASES_SEED} "
+        f"COW_ALLBASES_POOL_SIZE={CANON_COW_ALLBASES_POOL_SIZE} "
+        f"COW_ALLBASES_WRAP_PROB={CANON_COW_ALLBASES_WRAP_PROB} "
+        f"COW_DIRECT_POOL={int(CANON_COW_DIRECT_POOL)} "
+        f"COW_FLAT_MIXED_POOL={int(CANON_COW_FLAT_MIXED_POOL)} "
+        f"TC_ENRICH_FLAT_NO_FOCUS={int(CANON_TC_ENRICHMENT_FLAT_NO_FOCUS)} "
+        f"QUEST_FILTER={int(CANON_FILTER_QUEST_BASES)} "
+        f"PREFER_LOD_AZUREWRATH={int(CANON_PREFER_LOD_AZUREWRATH)}"
+    )
 
     vanilla = Path(args.vanilla).resolve()
     global _VANILLA_ROOT
@@ -3617,6 +3738,10 @@ def main():
     mod_root = out / mod_subroot
     mod_root.mkdir(parents=True, exist_ok=True)
 
+    # Restore UITOGGLE support from the old batch profile. With UITOGGLE=0, files are copied
+    # as disable* names so they remain available without becoming active.
+    copy_ui_overrides(mod_root, patch_sources, report, enable_ui=getattr(args, 'enable_ui', False))
+
     # 2) Seed patched txt targets from vanilla (source of truth) into the mod tree
     #    We copy the entire vanilla excel folder to avoid schema drift and keep new content.
     v_excel = vanilla / "data" / "global" / "excel"
@@ -3627,6 +3752,8 @@ def main():
     for p in v_excel.glob("*.txt"):
         shutil.copy2(p, o_excel / p.name)
     report.append(f"[vanilla] seeded excel txt from {v_excel} into {o_excel}")
+
+    patch_prefer_lod_azurewrath(mod_root, report)
 
     patch_charstats_from_reference(mod_root, patch_sources, report)
 
@@ -3642,7 +3769,7 @@ def main():
         report.append(f"[stage0-itemratio] ERROR: {e}")
 
     # 3) Apply locked patches to the mod root (vanilla schema already seeded)
-    patch_monstats_cow_xp_boost(mod_root, report, mult=9999)
+    patch_monstats_cow_xp_boost(mod_root, report, mult=COW_XP_MULTIPLIER)
 
     # Stage 4 optional: force cows to always drop at least one item.
     # Keep this extremely defensive: if a user's vanilla dump has unexpected TC naming/columns,
@@ -3653,13 +3780,6 @@ def main():
         report.append(f"[stage4-cow] ERROR: {type(e).__name__}: {e}")
 
 
-
-
-
-
-
-
-
     # Classic port layer: Port ALL non-assassin/druid uniques + enable their canonical bases for Classic (forge-only).
     # Expansion Drops in Classic: LoD unique/set port layer (staged)
     if args.enable_expansion_drops_in_classic and exp_port:
@@ -3667,9 +3787,26 @@ def main():
         apply_classic_unique_port_layer(mod_root, report)
     else:
         report.append("[exp-drops] skipping LoD unique/set port layer")
+
+    # True Stage-4 ladder restored from the old canon batch profile.
+    # These run AFTER the LoD port layer so cow/TC pools can see the newly Classic-enabled bases.
+    if args.enable_expansion_drops_in_classic and exp_cowfarm:
+        apply_cow_all_bases(
+            mod_root,
+            report,
+            enabled=getattr(args, "cow_all_bases", False),
+            full_chaos=(getattr(args, "cow_all_bases_full", False) and exp_chaos),
+        )
+    elif args.enable_expansion_drops_in_classic:
+        report.append("[cow-all-bases] Disabled by EXP_DROPS_STAGE/profile; skipped")
+
+    if args.enable_expansion_drops_in_classic and exp_tce:
+        apply_tc_enrichment_highlevel_bases(mod_root, report, enabled=True)
+    elif args.enable_expansion_drops_in_classic:
+        report.append("[tc-enrichment] Disabled by EXP_DROPS_STAGE/profile; skipped")
+
     patch_relax_item_requirements(mod_root, report)
-    patch_uniqueitems_force_max_rolls(mod_root, report)
-    verify_and_enforce_unique_max_rolls(mod_root, report)
+    apply_all_item_rolls_max(mod_root, report)
 
 
     apply_remove_unique_level_requirements(mod_root, report)
@@ -3679,7 +3816,10 @@ def main():
 
     validate_uniqueitems_invariants(mod_root, report)
 
-# Guardrail: if exp-drops is disabled (or stage=0), ensure no LoD->Classic version remaps slipped in.
+    # Guardrail: if exp-drops is disabled (or stage=0), ensure no LoD->Classic version remaps slipped in.
+    if not (args.enable_expansion_drops_in_classic and exp_port):
+        assert_no_lod_ports_when_disabled(vanilla_root, mod_root, report)
+
     apply_stage1_cow_harness(mod_root, vanilla_root, report, stage1_preset)
 
     # 4) Write run log
@@ -3705,17 +3845,6 @@ def find_column_by_name(header: list[str], desired_name: str) -> str | None:
         if normalize_column_key(k) == want:
             return k
     return None
-
-
-def build_row_index_by_column(rows: list[dict], key_column: str) -> dict[str, dict]:
-    """Index rows by lowercased, stripped value from key_column (skips empty keys)."""
-    idx: dict[str, dict] = {}
-    for r in rows:
-        v = (r.get(key_column) or "").strip()
-        if not v:
-            continue
-        idx[v.lower()] = r
-    return idx
 
 # === End helpers ===
 
