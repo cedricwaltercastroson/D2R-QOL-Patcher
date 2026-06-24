@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-D2R Classic patcher / merger (vanilla as source of truth).
+D2R Classic++ R200 Canon patcher / merger (vanilla as source of truth).
 
 This is a behaviour-preserving cleanup of the known-good patcher branch.
 Cleanup rules applied:
@@ -8,6 +8,7 @@ Cleanup rules applied:
 - Remove unused feature/experiment code from the live patcher.
 - Keep intentional safety guards and wire guards that have no gameplay-output effect.
 - Remove CLI flag dependency; this is now a zero-flag canon runner.
+- Preserve Cow King's native boss TreasureClass chain while regular cows use the flat mixed pool.
 
 Usage:
     python patcher.py
@@ -77,6 +78,9 @@ CANON_COW_ALLBASES_SEED = 1782137524
 CANON_COW_ALLBASES_POOL_SIZE = 45
 CANON_COW_ALLBASES_WRAP_PROB = 8192
 CANON_COW_DIRECT_POOL = True  # R200 direct cow pool: cows roll the full mixed zz_cow_allbases wrapper directly.
+# Preserve Cow King's native boss TreasureClass rows. Direct cow-all-bases is for regular
+# cow farming; overwriting Cow King rows can suppress/bypass his boss-style loot chain.
+CANON_PRESERVE_COW_KING_NATIVE_DROPS = True
 # Equalize cow drops across Normal/Nightmare/Hell and across eligible base codes.
 # Without this, FULL CHAOS weights normal/exceptional/elite tiers equally, which overweights elite codes
 # because there are fewer elite codes than normal codes.
@@ -98,6 +102,37 @@ CANON_FILTER_QUEST_BASES = True
 # Phase Blade itself remains allowed in the mixed base pool.
 CANON_PREFER_LOD_AZUREWRATH = True
 R200_AZUREWRATH_LOD_BASE_CODE = '7cr'
+
+# R200 canon JAVE support based on the v7 stability finding.
+# Monster TreasureClass generation produced Long Sword fallback while JAVE stayed on
+# the stackable/throwable `jave` path. Canon converts regular JAVE bases into
+# stackless spear-like bases for Classic-safe monster drops/forge resolution.
+# No diagnostic ID-scroll cube recipe or nuclear TreasureClass overrides are included.
+CANON_ENABLE_JAVE_STACKLESS_SPEAR_BRANCH = True
+JAVE_STACKLESS_BASE_CODES = {
+    'jav', 'pil', 'ssp', 'glv', 'tsp',
+    '9ja', '9pi', '9s9', '9gl', '9ts',
+    '7ja', '7pi', '7s7', '7gl', '7ts',
+}
+JAVE_STACKLESS_UNIQUE_SANITIZE_PROPS = {'rep-quant', 'stack'}
+
+# R200 canon Amazon-specific support. After regular JAVE stability proved sound,
+# Amazon class-specific bow/spear/javelin bases are enabled through stable non-class
+# itemtype profiles for Classic-safe monster drops/forge resolution.
+# The Amazon stability harness is not part of canon and remains disabled.
+CANON_ENABLE_AMAZON_SPECIFIC_BRANCH = True
+CANON_ENABLE_AMAZON_SPECIFIC_STABILITY_HARNESS = False
+
+AMAZON_ABOW_BASE_CODES = {'am1', 'am2', 'am6', 'am7', 'amb', 'amc'}
+AMAZON_ASPE_BASE_CODES = {'am3', 'am4', 'am8', 'am9', 'amd', 'ame'}
+AMAZON_AJAV_BASE_CODES = {'am5', 'ama', 'amf'}
+AMAZON_SPECIFIC_BASE_CODES = AMAZON_ABOW_BASE_CODES | AMAZON_ASPE_BASE_CODES | AMAZON_AJAV_BASE_CODES
+AMAZON_SPECIFIC_HARNESS_CODES_ORDERED = [
+    'am1', 'am2', 'am3', 'am4', 'am5',
+    'am6', 'am7', 'am8', 'am9', 'ama',
+    'amb', 'amc', 'amd', 'ame', 'amf',
+]
+AMAZON_SPECIFIC_UNIQUE_SANITIZE_PROPS = {'rep-quant', 'stack'}
 R200_SUPERSEDED_UNIQUE_KEYS: set[tuple[str, str]] = set()  # (unique index/name, base code)
 R200_SUPERSEDED_BASE_CODES: set[str] = set()  # kept for future duplicate-base suppressions
 
@@ -1386,6 +1421,548 @@ def apply_remove_set_level_requirements(mod_root, report):
 
 
 
+
+def apply_jave_stackless_spear_forward_branch(mod_root: Path, report: list[str]) -> None:
+    """Canon JAVE stackless support derived from the v7 isolation result.
+
+    Findings from v7:
+      - `jav` is valid in Classic through cubemain.
+      - Monster TC generation produced Long Sword until the selected JAVE row was
+        converted from stackable/throwable `type=jave` into a stackless spear-like row.
+
+    This branch applies that mutation to the regular JAVE family only (type `jave`, not
+    Amazon `ajav`) so normal Stage4 cow/TC logic can drop JAVE without diagnostic hacks.
+    It deliberately does NOT inject the temporary `Identify Scroll -> Javelin` cube recipe.
+    """
+    if not CANON_ENABLE_JAVE_STACKLESS_SPEAR_BRANCH:
+        report.append("[jave-forward] disabled; regular JAVE behavior unchanged")
+        return
+
+    excel = mod_root / "data/global/excel"
+    p_weapons = excel / "weapons.txt"
+    p_unique = excel / "uniqueitems.txt"
+    if not p_weapons.exists():
+        report.append("[jave-forward] weapons.txt not found; skipped")
+        return
+
+    h, rows, nl = read_tsv(p_weapons)
+    code_k = find_column_by_name(h, "code")
+    type_k = find_column_by_name(h, "type")
+    if not code_k or not type_k:
+        report.append("[jave-forward] weapons.txt missing code/type column; skipped")
+        return
+
+    def set_cell(row: dict[str, str], colname: str, value: str) -> int:
+        k = find_column_by_name(h, colname)
+        if not k:
+            return 0
+        if (row.get(k) or "") != value:
+            row[k] = value
+            return 1
+        return 0
+
+    def get_cell(row: dict[str, str], colname: str) -> str:
+        k = find_column_by_name(h, colname)
+        return (row.get(k) or "").strip() if k else ""
+
+    changed_rows = 0
+    changed_cells = 0
+    touched_codes: list[str] = []
+
+    for r in rows:
+        code = (r.get(code_k) or "").strip().lower()
+        typ = (r.get(type_k) or "").strip().lower()
+        if code not in JAVE_STACKLESS_BASE_CODES or typ != "jave":
+            continue
+
+        # Preserve the original melee damage by moving it to the two-handed fields used by spears.
+        orig_mindam = get_cell(r, "mindam") or "1"
+        orig_maxdam = get_cell(r, "maxdam") or "5"
+
+        row_cells = 0
+        for col, val in [
+            ("type", "spea"),
+            ("type2", ""),
+            ("version", "0"),
+            ("spawnable", "1"),
+            ("ShowLevel", "1"),
+            ("stackable", ""),
+            ("minstack", ""),
+            ("maxstack", ""),
+            ("spawnstack", ""),
+            ("missiletype", "0"),
+            ("qntwarning", "0"),
+            ("hasinv", "1"),
+            ("useable", "0"),
+            ("wclass", "2ht"),
+            ("2handedwclass", "2ht"),
+            ("hit class", "2ht"),
+            ("1or2handed", ""),
+            ("2handed", "1"),
+            ("2handmindam", orig_mindam),
+            ("2handmaxdam", orig_maxdam),
+            ("mindam", ""),
+            ("maxdam", ""),
+            ("minmisdam", ""),
+            ("maxmisdam", ""),
+            ("dropsound", "item_staff"),
+            ("usesound", "item_staff"),
+        ]:
+            row_cells += set_cell(r, col, val)
+
+        if row_cells:
+            changed_rows += 1
+            changed_cells += row_cells
+        touched_codes.append(code)
+
+    if touched_codes:
+        write_tsv(p_weapons, h, rows, nl)
+        report.append(
+            f"[jave-forward] STACKLESS SPEAR PROFILE: mutated regular JAVE base rows "
+            f"codes={','.join(sorted(touched_codes))} rows_changed={changed_rows} cells_changed={changed_cells}"
+        )
+    else:
+        report.append("[jave-forward] WARNING: no regular JAVE rows were mutated")
+
+    # Unique cleanup: some LoD javelin uniques carry quantity-only properties.  If the base
+    # is now stackless, those properties are no longer meaningful and may be unsafe/noisy.
+    if not p_unique.exists() or not touched_codes:
+        return
+
+    uh, urows, unl = read_tsv(p_unique)
+    u_code_k = find_column_by_name(uh, "code")
+    if not u_code_k:
+        report.append("[jave-forward] uniqueitems.txt missing code column; unique quantity cleanup skipped")
+        return
+
+    def clear_unique_prop(row: dict[str, str], n: str) -> int:
+        cells = 0
+        for prefix in ("prop", "par", "min", "max"):
+            k = find_column_by_name(uh, f"{prefix}{n}")
+            if k and (row.get(k) or "") != "":
+                row[k] = ""
+                cells += 1
+        return cells
+
+    unique_rows_changed = 0
+    unique_cells_changed = 0
+    unique_names: list[str] = []
+    idx_k = find_column_by_name(uh, "index") or find_column_by_name(uh, "*index") or (uh[0] if uh else None)
+
+    for r in urows:
+        code = (r.get(u_code_k) or "").strip().lower()
+        if code not in JAVE_STACKLESS_BASE_CODES:
+            continue
+        row_cells = 0
+        for k in uh:
+            nk = normalize_column_key(k)
+            if not nk.startswith("prop"):
+                continue
+            suffix = ''.join(ch for ch in nk if ch.isdigit())
+            if not suffix:
+                continue
+            prop = (r.get(k) or "").strip().lower()
+            if prop in JAVE_STACKLESS_UNIQUE_SANITIZE_PROPS:
+                row_cells += clear_unique_prop(r, suffix)
+        if row_cells:
+            unique_rows_changed += 1
+            unique_cells_changed += row_cells
+            unique_names.append((r.get(idx_k) or code) if idx_k else code)
+
+    if unique_cells_changed:
+        write_tsv(p_unique, uh, urows, unl)
+    report.append(
+        f"[jave-forward] unique quantity cleanup: rows_changed={unique_rows_changed} "
+        f"cells_changed={unique_cells_changed} names={','.join(unique_names) if unique_names else '<none>'}"
+    )
+
+
+def apply_amazon_specific_forward_branch(mod_root: Path, report: list[str]) -> None:
+    """Canon Amazon-specific stable-profile support.
+
+    Applies the regular-JAVE lesson to Amazon class-specific bases:
+      - Amazon bows become normal bow-type bases for Classic monster drops/forge.
+      - Amazon spears become normal spear-type bases.
+      - Amazon javelins become stackless spear-like bases, matching the safe JAVE route.
+
+    This keeps the original item codes/names/graphics, so uniques/sets can still resolve
+    by their vanilla code. It deliberately does not add any diagnostic cube recipe.
+    """
+    if not CANON_ENABLE_AMAZON_SPECIFIC_BRANCH:
+        report.append("[amazon-forward] disabled; Amazon-specific bases unchanged")
+        return
+
+    excel = mod_root / "data/global/excel"
+    p_weapons = excel / "weapons.txt"
+    p_unique = excel / "uniqueitems.txt"
+    if not p_weapons.exists():
+        report.append("[amazon-forward] weapons.txt not found; skipped")
+        return
+
+    h, rows, nl = read_tsv(p_weapons)
+    code_k = find_column_by_name(h, "code")
+    type_k = find_column_by_name(h, "type")
+    if not code_k or not type_k:
+        report.append("[amazon-forward] weapons.txt missing code/type column; skipped")
+        return
+
+    def set_cell(row: dict[str, str], colname: str, value: str) -> int:
+        k = find_column_by_name(h, colname)
+        if not k:
+            return 0
+        if (row.get(k) or "") != value:
+            row[k] = value
+            return 1
+        return 0
+
+    def get_cell(row: dict[str, str], colname: str) -> str:
+        k = find_column_by_name(h, colname)
+        return (row.get(k) or "").strip() if k else ""
+
+    changed_rows = 0
+    changed_cells = 0
+    bow_codes: list[str] = []
+    spear_codes: list[str] = []
+    ajav_codes: list[str] = []
+
+    for r in rows:
+        code = (r.get(code_k) or "").strip().lower()
+        if code not in AMAZON_SPECIFIC_BASE_CODES:
+            continue
+        orig_type = (r.get(type_k) or "").strip().lower()
+        row_cells = 0
+
+        # Common Classic visibility/drop safety.
+        for col, val in [
+            ("version", "0"),
+            ("spawnable", "1"),
+            ("ShowLevel", "1"),
+            ("hasinv", "1"),
+            ("useable", "0"),
+        ]:
+            row_cells += set_cell(r, col, val)
+
+        if code in AMAZON_ABOW_BASE_CODES:
+            # Keep bow mechanics but remove the class-specific abow itemtype gate.
+            for col, val in [
+                ("type", "bow"),
+                ("type2", ""),
+                ("stackable", ""),
+                ("minstack", ""),
+                ("maxstack", ""),
+                ("spawnstack", ""),
+                ("missiletype", "0"),
+                ("wclass", "bow"),
+                ("2handedwclass", "bow"),
+                ("hit class", "bow"),
+                ("1or2handed", ""),
+                ("2handed", "1"),
+                ("dropsound", "item_bow"),
+                ("usesound", "item_bow"),
+            ]:
+                row_cells += set_cell(r, col, val)
+            bow_codes.append(code)
+
+        elif code in AMAZON_ASPE_BASE_CODES:
+            # Keep spear mechanics but remove the class-specific aspe itemtype gate.
+            orig_mindam = get_cell(r, "mindam") or get_cell(r, "2handmindam") or "1"
+            orig_maxdam = get_cell(r, "maxdam") or get_cell(r, "2handmaxdam") or "5"
+            for col, val in [
+                ("type", "spea"),
+                ("type2", ""),
+                ("stackable", ""),
+                ("minstack", ""),
+                ("maxstack", ""),
+                ("spawnstack", ""),
+                ("missiletype", "0"),
+                ("wclass", "2ht"),
+                ("2handedwclass", "2ht"),
+                ("hit class", "2ht"),
+                ("1or2handed", ""),
+                ("2handed", "1"),
+                ("2handmindam", orig_mindam),
+                ("2handmaxdam", orig_maxdam),
+                ("mindam", ""),
+                ("maxdam", ""),
+                ("minmisdam", ""),
+                ("maxmisdam", ""),
+                ("dropsound", "item_staff"),
+                ("usesound", "item_staff"),
+            ]:
+                row_cells += set_cell(r, col, val)
+            spear_codes.append(code)
+
+        elif code in AMAZON_AJAV_BASE_CODES:
+            # Same safe route as regular JAVE: convert thrown stacks to stackless spear-like bases.
+            orig_mindam = get_cell(r, "mindam") or "1"
+            orig_maxdam = get_cell(r, "maxdam") or "5"
+            for col, val in [
+                ("type", "spea"),
+                ("type2", ""),
+                ("stackable", ""),
+                ("minstack", ""),
+                ("maxstack", ""),
+                ("spawnstack", ""),
+                ("missiletype", "0"),
+                ("qntwarning", "0"),
+                ("wclass", "2ht"),
+                ("2handedwclass", "2ht"),
+                ("hit class", "2ht"),
+                ("1or2handed", ""),
+                ("2handed", "1"),
+                ("2handmindam", orig_mindam),
+                ("2handmaxdam", orig_maxdam),
+                ("mindam", ""),
+                ("maxdam", ""),
+                ("minmisdam", ""),
+                ("maxmisdam", ""),
+                ("dropsound", "item_staff"),
+                ("usesound", "item_staff"),
+            ]:
+                row_cells += set_cell(r, col, val)
+            ajav_codes.append(code)
+
+        if row_cells:
+            changed_rows += 1
+            changed_cells += row_cells
+
+    if changed_cells:
+        write_tsv(p_weapons, h, rows, nl)
+
+    report.append(
+        f"[amazon-forward] CLASS-SPECIFIC STABLE PROFILE: bow={','.join(sorted(bow_codes)) or '<none>'} "
+        f"spear={','.join(sorted(spear_codes)) or '<none>'} ajav_stackless={','.join(sorted(ajav_codes)) or '<none>'} "
+        f"rows_changed={changed_rows} cells_changed={changed_cells}"
+    )
+
+    # Unique cleanup: quantity-only props are unsafe/noisy after AJAV becomes stackless.
+    if not p_unique.exists():
+        return
+    uh, urows, unl = read_tsv(p_unique)
+    u_code_k = find_column_by_name(uh, "code")
+    if not u_code_k:
+        report.append("[amazon-forward] uniqueitems.txt missing code column; unique quantity cleanup skipped")
+        return
+
+    def clear_unique_prop(row: dict[str, str], n: str) -> int:
+        cells = 0
+        for prefix in ("prop", "par", "min", "max"):
+            k = find_column_by_name(uh, f"{prefix}{n}")
+            if k and (row.get(k) or "") != "":
+                row[k] = ""
+                cells += 1
+        return cells
+
+    idx_k = find_column_by_name(uh, "index") or find_column_by_name(uh, "*index") or (uh[0] if uh else None)
+    unique_rows_changed = 0
+    unique_cells_changed = 0
+    unique_names: list[str] = []
+    for r in urows:
+        code = (r.get(u_code_k) or "").strip().lower()
+        if code not in AMAZON_SPECIFIC_BASE_CODES:
+            continue
+        row_cells = 0
+        for k in uh:
+            nk = normalize_column_key(k)
+            if not nk.startswith("prop"):
+                continue
+            suffix = ''.join(ch for ch in nk if ch.isdigit())
+            if not suffix:
+                continue
+            prop = (r.get(k) or "").strip().lower()
+            if prop in AMAZON_SPECIFIC_UNIQUE_SANITIZE_PROPS:
+                row_cells += clear_unique_prop(r, suffix)
+        if row_cells:
+            unique_rows_changed += 1
+            unique_cells_changed += row_cells
+            unique_names.append((r.get(idx_k) or code) if idx_k else code)
+
+    if unique_cells_changed:
+        write_tsv(p_unique, uh, urows, unl)
+    report.append(
+        f"[amazon-forward] unique quantity cleanup: rows_changed={unique_rows_changed} "
+        f"cells_changed={unique_cells_changed} names={','.join(unique_names) if unique_names else '<none>'}"
+    )
+
+
+def apply_amazon_specific_stability_harness(mod_root: Path, report: list[str]) -> None:
+    """Force cow drops to Amazon class-specific base families for stability testing.
+
+    This runs after the normal cow/TC systems and overwrites cow-facing routes only.
+    It deliberately does not add any cube-control recipe.
+    """
+    if not CANON_ENABLE_AMAZON_SPECIFIC_STABILITY_HARNESS:
+        report.append("[amazon-harness] disabled; normal Amazon forward pool remains active")
+        return
+
+    excel = mod_root / "data/global/excel"
+    p_tc = excel / "treasureclassex.txt"
+    p_mon = excel / "monstats.txt"
+    if not p_tc.exists():
+        report.append("[amazon-harness] treasureclassex.txt not found; skipped")
+        return
+
+    h, rows, nl = read_tsv(p_tc)
+    tc_k = find_column_by_name(h, "Treasure Class") or (h[0] if h else None)
+    if not tc_k:
+        report.append("[amazon-harness] treasureclassex missing TC name column; skipped")
+        return
+
+    def _n(v: str) -> str:
+        return normalize_column_key(v)
+
+    item_cols = [c for c in h if _n(c).startswith("item")]
+    prob_cols = [c for c in h if _n(c).startswith("prob")]
+
+    def _suffix_num(col: str) -> int:
+        import re
+        m = re.search(r"(\d+)$", _n(col))
+        return int(m.group(1)) if m else 0
+
+    item_cols.sort(key=_suffix_num)
+    prob_cols.sort(key=_suffix_num)
+    max_slots = min(len(item_cols), len(prob_cols))
+    if not item_cols or not prob_cols:
+        report.append("[amazon-harness] treasureclassex missing Item/Prob columns; skipped")
+        return
+
+    picks_k = find_column_by_name(h, "Picks")
+    nodrop_k = find_column_by_name(h, "NoDrop")
+    group_k = find_column_by_name(h, "group")
+    level_k = find_column_by_name(h, "level")
+    unique_k = find_column_by_name(h, "Unique")
+    set_k = find_column_by_name(h, "Set")
+    rare_k = find_column_by_name(h, "Rare")
+    magic_k = find_column_by_name(h, "Magic")
+
+    by_name = {(r.get(tc_k) or "").strip(): r for r in rows if (r.get(tc_k) or "").strip()}
+
+    def base_tc_row(name: str) -> dict[str, str]:
+        r = {k: "" for k in h}
+        r[tc_k] = name
+        if picks_k: r[picks_k] = "1"
+        if nodrop_k: r[nodrop_k] = "0"
+        if group_k: r[group_k] = "0"
+        if level_k: r[level_k] = "0"
+        if unique_k: r[unique_k] = "0"
+        if set_k: r[set_k] = "0"
+        if rare_k: r[rare_k] = "0"
+        if magic_k: r[magic_k] = "0"
+        return r
+
+    def set_tc_items(r: dict[str, str], items: list[str], probs: list[int]) -> int:
+        changed = 0
+        for k, v in [(picks_k, "1"), (nodrop_k, "0"), (unique_k, "0"), (set_k, "0"), (rare_k, "0"), (magic_k, "0")]:
+            if k and (r.get(k) or "") != v:
+                r[k] = v
+                changed += 1
+        for i in range(max_slots):
+            iv = items[i] if i < len(items) else ""
+            pv = str(probs[i]) if i < len(probs) else ""
+            if (r.get(item_cols[i]) or "") != iv:
+                r[item_cols[i]] = iv
+                changed += 1
+            if (r.get(prob_cols[i]) or "") != pv:
+                r[prob_cols[i]] = pv
+                changed += 1
+        return changed
+
+    codes = list(AMAZON_SPECIFIC_HARNESS_CODES_ORDERED)
+    rows_added = 0
+    rows_changed = 0
+    cells_changed = 0
+
+    chunk_names: list[str] = []
+    chunk_sizes: list[int] = []
+    for idx in range(0, len(codes), max_slots):
+        chunk = codes[idx:idx + max_slots]
+        cname = f"zz_amazon_specific_harness_{(idx // max_slots) + 1:02d}"
+        chunk_names.append(cname)
+        chunk_sizes.append(len(chunk))
+        r = by_name.get(cname)
+        if r is None:
+            r = base_tc_row(cname)
+            rows.append(r)
+            by_name[cname] = r
+            rows_added += 1
+        c = set_tc_items(r, chunk, [1] * len(chunk))
+        if c:
+            rows_changed += 1
+            cells_changed += c
+
+    wrapper_name = "zz_amazon_specific_harness_all"
+    wrapper = by_name.get(wrapper_name)
+    if wrapper is None:
+        wrapper = base_tc_row(wrapper_name)
+        rows.append(wrapper)
+        by_name[wrapper_name] = wrapper
+        rows_added += 1
+    c = set_tc_items(wrapper, chunk_names, chunk_sizes)
+    if c:
+        rows_changed += 1
+        cells_changed += c
+
+    cow_targets = {
+        "Cow", "Cow (N)", "Cow (H)",
+        "Act 4 Champ B", "Act 4 (N) Champ B", "Act 4 (H) Champ B",
+        "Act 4 Unique B", "Act 4 (N) Unique B", "Act 4 (H) Unique B",
+        "Act 4 (H) Champ B Desecrated", "Act 4 (H) Unique B Desecrated",
+    }
+    cow_rows_changed = 0
+    cow_cells_changed = 0
+    for r in rows:
+        name = (r.get(tc_k) or "").strip()
+        if name not in cow_targets:
+            continue
+        c = set_tc_items(r, [wrapper_name], [1])
+        if c:
+            cow_rows_changed += 1
+            cow_cells_changed += c
+
+    write_tsv(p_tc, h, rows, nl)
+
+    mon_rows_changed = 0
+    mon_cells_changed = 0
+    mon_cols = 0
+    if p_mon.exists():
+        mh, mrows, mnl = read_tsv(p_mon)
+        id_k = find_column_by_name(mh, "Id") or find_column_by_name(mh, "id")
+        tc_cols = [c for c in mh if normalize_column_key(c).startswith("treasureclass")]
+        mon_cols = len(tc_cols)
+        for mr in mrows:
+            mid = (mr.get(id_k) or "").strip().lower() if id_k else ""
+            if mid not in {"hellbovine", "cowking"}:
+                continue
+            row_changed = False
+            for ccol in tc_cols:
+                if (mr.get(ccol) or "").strip() != wrapper_name:
+                    mr[ccol] = wrapper_name
+                    mon_cells_changed += 1
+                    row_changed = True
+            if row_changed:
+                mon_rows_changed += 1
+        if mon_cells_changed:
+            write_tsv(p_mon, mh, mrows, mnl)
+
+    verify_parts = []
+    for name in ["Cow", "Cow (N)", "Cow (H)", wrapper_name] + chunk_names:
+        r = by_name.get(name)
+        if not r:
+            verify_parts.append(f"{name}:<missing>")
+            continue
+        first = (r.get(item_cols[0]) or "").strip() if item_cols else ""
+        prob = (r.get(prob_cols[0]) or "").strip() if prob_cols else ""
+        verify_parts.append(f"{name}:{first}/{prob}")
+
+    report.append(
+        f"[amazon-harness] AMAZON-SPECIFIC STABILITY HARNESS active: forced cow drops to Amazon class-specific families; "
+        f"codes={','.join(codes)} wrapper={wrapper_name} chunk_rows={len(chunk_names)} "
+        f"rows_added={rows_added} rows_changed={rows_changed} cells_changed={cells_changed} "
+        f"cow_rows_changed={cow_rows_changed} cow_cells_changed={cow_cells_changed} "
+        f"monstats_rows_changed={mon_rows_changed} monstats_cells_changed={mon_cells_changed} monstats_tc_cols={mon_cols} "
+        f"verify={';'.join(verify_parts)}"
+    )
+
 # === Stage-4 true expansion drop/cow farm systems restored from working branch ===
 
 def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_chaos: bool) -> None:
@@ -1509,6 +2086,22 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
 
     _collect_base_codes_from_mappings(excel / "uniqueitems.txt", "uniqueitems")
     _collect_base_codes_from_mappings(excel / "setitems.txt", "setitems")
+
+    if CANON_ENABLE_JAVE_STACKLESS_SPEAR_BRANCH:
+        before_jave = len(forge_enabled_base_codes)
+        forge_enabled_base_codes.update(JAVE_STACKLESS_BASE_CODES)
+        report.append(
+            f"[cow-all-bases] JAVE forward: injected {len(forge_enabled_base_codes) - before_jave} "
+            f"stackless JAVE base code(s) into cow sampler eligibility"
+        )
+
+    if CANON_ENABLE_AMAZON_SPECIFIC_BRANCH:
+        before_amazon = len(forge_enabled_base_codes)
+        forge_enabled_base_codes.update(AMAZON_SPECIFIC_BASE_CODES)
+        report.append(
+            f"[cow-all-bases] Amazon forward: injected {len(forge_enabled_base_codes) - before_amazon} "
+            f"Amazon-specific base code(s) into cow sampler eligibility"
+        )
 
     # --- Collect base codes from armor/weapons/misc (spawnable when possible)
     base_codes = {}  # code -> (type, type2)
@@ -1819,8 +2412,14 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
             return wrap_NM
         return wrap_N
 
+    def is_cow_king_tc_name(name: str) -> bool:
+        n = (name or "").strip().lower()
+        return n.startswith("cow king") or n.startswith("cowking")
+
     # Discover exact cow TC names from monstats so we also catch champ/unique/desecrated cow routes
     # such as Act 4 Champ B / Act 4 Unique B, which do not necessarily contain the word "cow".
+    # R200 direct pool is intentionally limited to regular cow-farm routes; Cow King boss rows
+    # are preserved natively so his special Picks=5 / Uitem+Melee chains are not bypassed.
     cow_tc_names: set[str] = set()
     monstats_patched = 0
     if p_mon.exists():
@@ -1833,6 +2432,11 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
             for mr in mrows:
                 mid = (mr.get(id_col) or "").strip().lower()
                 if mid not in ("hellbovine", "cowking"):
+                    continue
+                # Keep Cow King native in canon. His actual boss loot is represented by
+                # Cow King TreasureClassEx rows / superunique routes, not the regular cow
+                # all-bases sampler. Still allow old behavior if the guard is disabled.
+                if mid == "cowking" and CANON_PRESERVE_COW_KING_NATIVE_DROPS:
                     continue
                 for c in tc_cols:
                     v = (mr.get(c) or "").strip()
@@ -1851,6 +2455,10 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
         _nl = _name.lower()
         # Only patch ORIGINAL cow-related TCs. Exclude zz_* helper TCs to avoid self-references.
         if _nl.startswith("zz_") or "zz_cow_allbases" in _nl:
+            continue
+        # Preserve Cow King boss TC rows. They carry their own Picks/quality chains and
+        # should not be flattened into the regular cow all-bases wrapper.
+        if CANON_PRESERVE_COW_KING_NATIVE_DROPS and is_cow_king_tc_name(_name):
             continue
         if _name in cow_tc_names or "cow" in _nl:
             cow_rows.append(_r)
@@ -1891,6 +2499,29 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
                 injected += 1
                 break
 
+    cowking_rows_seen = 0
+    cowking_nodrop_fixed = 0
+    cowking_picks_fixed = 0
+    if CANON_PRESERVE_COW_KING_NATIVE_DROPS:
+        for kr in tc_rows:
+            kname = (kr.get(tc_key) or "").strip()
+            if not is_cow_king_tc_name(kname):
+                continue
+            cowking_rows_seen += 1
+            if nodrop_key and (kr.get(nodrop_key) or "").strip() != "0":
+                kr[nodrop_key] = "0"
+                cowking_nodrop_fixed += 1
+            # Preserve native positive and negative Picks values. Only repair blank/zero rows.
+            if picks_key:
+                rawp = (kr.get(picks_key) or "").strip()
+                try:
+                    pv = int(rawp or "0")
+                except Exception:
+                    pv = 0
+                if pv == 0:
+                    kr[picks_key] = "5"
+                    cowking_picks_fixed += 1
+
     write_tsv(p_tc, th, tc_rows)
 
     pool_preview = ",".join(all_codes[:40]) + ("..." if len(all_codes) > 40 else "")
@@ -1900,6 +2531,11 @@ def apply_cow_all_bases(mod_root: Path, report: list[str], enabled: bool, full_c
         f"cow rows patched={injected} mode={'direct' if CANON_COW_DIRECT_POOL else 'empty-slot'} "
         f"(wrapper prob={wrap_prob}; monstats_patched={monstats_patched})"
     )
+    if CANON_PRESERVE_COW_KING_NATIVE_DROPS:
+        report.append(
+            f"[cow-king] preserved native Cow King boss treasure classes: rows={cowking_rows_seen} "
+            f"nodrop_fixed={cowking_nodrop_fixed} picks_fixed={cowking_picks_fixed}"
+        )
     if CANON_COW_FLAT_MIXED_POOL:
         report.append(f"[cow-all-bases] Wrapper: ALL_DIFFICULTIES={wrap_N}")
         report.append(
@@ -3709,10 +4345,14 @@ def main():
         f"COW_ALLBASES_POOL_SIZE={CANON_COW_ALLBASES_POOL_SIZE} "
         f"COW_ALLBASES_WRAP_PROB={CANON_COW_ALLBASES_WRAP_PROB} "
         f"COW_DIRECT_POOL={int(CANON_COW_DIRECT_POOL)} "
+        f"COWKING_NATIVE={int(CANON_PRESERVE_COW_KING_NATIVE_DROPS)} "
         f"COW_FLAT_MIXED_POOL={int(CANON_COW_FLAT_MIXED_POOL)} "
         f"TC_ENRICH_FLAT_NO_FOCUS={int(CANON_TC_ENRICHMENT_FLAT_NO_FOCUS)} "
         f"QUEST_FILTER={int(CANON_FILTER_QUEST_BASES)} "
-        f"PREFER_LOD_AZUREWRATH={int(CANON_PREFER_LOD_AZUREWRATH)}"
+        f"PREFER_LOD_AZUREWRATH={int(CANON_PREFER_LOD_AZUREWRATH)} "
+        f"JAVE_STACKLESS_SPEAR={int(CANON_ENABLE_JAVE_STACKLESS_SPEAR_BRANCH)} "
+        f"AMAZON_SPECIFIC={int(CANON_ENABLE_AMAZON_SPECIFIC_BRANCH)} "
+        f"AMAZON_SPECIFIC_HARNESS={int(CANON_ENABLE_AMAZON_SPECIFIC_STABILITY_HARNESS)}"
     )
 
     vanilla = Path(args.vanilla).resolve()
@@ -3780,6 +4420,11 @@ def main():
         report.append(f"[stage4-cow] ERROR: {type(e).__name__}: {e}")
 
 
+    # Canon stackless branch: apply v7-proven JAVE/Amazon profiles before the port layer
+    # so regular JAVE uniques/bases can be evaluated through the normal Stage4 machinery.
+    apply_jave_stackless_spear_forward_branch(mod_root, report)
+    apply_amazon_specific_forward_branch(mod_root, report)
+
     # Classic port layer: Port ALL non-assassin/druid uniques + enable their canonical bases for Classic (forge-only).
     # Expansion Drops in Classic: LoD unique/set port layer (staged)
     if args.enable_expansion_drops_in_classic and exp_port:
@@ -3804,6 +4449,8 @@ def main():
         apply_tc_enrichment_highlevel_bases(mod_root, report, enabled=True)
     elif args.enable_expansion_drops_in_classic:
         report.append("[tc-enrichment] Disabled by EXP_DROPS_STAGE/profile; skipped")
+
+    apply_amazon_specific_stability_harness(mod_root, report)
 
     patch_relax_item_requirements(mod_root, report)
     apply_all_item_rolls_max(mod_root, report)
