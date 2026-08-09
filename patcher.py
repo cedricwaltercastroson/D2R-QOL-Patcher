@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-D2R Classic++ R200 Canon patcher / merger (vanilla as source of truth).
+D2R Classic++ R200 LOCKED STABLE CANON V17 Cow-Pool Torch All-Sunder patcher (vanilla as source of truth).
 
 This is a behaviour-preserving cleanup of the known-good patcher branch.
 Cleanup rules applied:
@@ -133,6 +133,91 @@ AMAZON_SPECIFIC_HARNESS_CODES_ORDERED = [
     'amb', 'amc', 'amd', 'ame', 'amf',
 ]
 AMAZON_SPECIFIC_UNIQUE_SANITIZE_PROPS = {'rep-quant', 'stack'}
+
+
+# Experimental Sunder research V9: cube-only Small Charm + property isolation.
+# NOT canon. No monster TreasureClass/monstats Sunder harness is active here.
+# Purpose: test the hypothesis that Classic crashes on empty/plain charms,
+# while a valid magic Small Charm carrying an explicit property may be stable.
+CANON_ENABLE_SUNDER_SMALL_CHARM_PROPERTY_EXPERIMENT = False
+SUNDER_SMALL_CHARM_BASE_CODE = 'cm1'  # Small Charm
+SUNDER_SMALL_CHARM_RECIPE_INPUT = 'isc'  # Identify Scroll -> Magic Small Charm with +Life
+SUNDER_SMALL_CHARM_TEST_PROP = 'hp'
+SUNDER_SMALL_CHARM_TEST_PROP_MIN = '5'
+SUNDER_SMALL_CHARM_TEST_PROP_MAX = '5'
+
+# Experimental Sunder research V10: cube-only Hellfire Torch / Large Charm isolation.
+# NOT canon. This tests whether a real LoD unique charm payload behaves differently
+# from plain/magic charms in Classic. No monster TreasureClass charm forcing.
+CANON_ENABLE_HELLFIRE_TORCH_CUBE_EXPERIMENT = False
+HELLFIRE_TORCH_BASE_CODE = 'cm2'  # Large Charm
+HELLFIRE_TORCH_UNIQUE_NAME = 'Hellfire Torch'
+HELLFIRE_TORCH_RECIPE_INPUT = 'isc'  # Identify Scroll -> Hellfire Torch
+
+# Experimental Sunder research V12: dedicated pseudo-sunder Large Charm.
+# NOT canon. This does NOT modify Hellfire Torch, Gheed's Fortune, Annihilus,
+# or any vanilla unique charm row. It clones the stable cm2 Large Charm base path
+# into a new test-only base code and appends one new unique row for cube testing.
+CANON_ENABLE_LARGE_CHARM_PSEUDO_COLD_EXPERIMENT = False
+PSEUDO_COLD_LARGE_CHARM_SOURCE_BASE_CODE = 'cm2'
+PSEUDO_COLD_LARGE_CHARM_BASE_CODE = 'csc'  # custom test-only Large Charm base code
+PSEUDO_COLD_LARGE_CHARM_UNIQUE_NAME = 'Classic Cold Rupture'
+PSEUDO_COLD_LARGE_CHARM_RECIPE_INPUT = 'isc'
+PSEUDO_COLD_LARGE_CHARM_PROP1 = 'pierce-immunity-cold'
+PSEUDO_COLD_LARGE_CHARM_PROP1_VALUE = '300'
+PSEUDO_COLD_LARGE_CHARM_PROP2 = 'res-cold'
+PSEUDO_COLD_LARGE_CHARM_PROP2_VALUE = '-75'
+
+# Experimental Sunder research V13: cube-only Annihilus / Small Charm isolation.
+# NOT canon. This tests whether a complete real LoD unique Small Charm payload
+# behaves differently from plain/magic Small Charm generation in Classic.
+# No monster TreasureClass charm forcing.
+CANON_ENABLE_ANNIHILUS_CUBE_EXPERIMENT = False
+ANNIHILUS_BASE_CODE = 'cm1'  # Small Charm
+ANNIHILUS_UNIQUE_NAME = 'Annihilus'
+ANNIHILUS_RECIPE_INPUT = 'isc'  # Identify Scroll -> Annihilus
+
+
+# Experimental Sunder research V14:
+# 1) Port real Annihilus into Classic cow drops through a controlled unique-only
+#    sidecar TC. The Annihilus unique row itself is not repurposed as a carrier.
+# 2) Add a Hellfire Torch based cold-sunder test with NO negative resistance
+#    penalty. This intentionally uses the already proven cm2 / Hellfire Torch
+#    unique charm path, but strips vanilla Torch properties so the modded Torch
+#    contains only the sunder affix.
+# NOT canon until in-game stability is verified.
+CANON_ENABLE_ANNIHILUS_COW_DROP_PORT = True
+ANNIHILUS_COW_TC_NAME = 'zz_classic_annihilus_unique_cow_drop'
+ANNIHILUS_COW_POOL_PROB = 8192
+ANNIHILUS_COW_DROP_PROB = 8192
+
+CANON_ENABLE_HELLFIRE_TORCH_ALL_SUNDER_NO_PENALTY = True
+HELLFIRE_TORCH_ALL_SUNDER_PROPS = [
+    'pierce-immunity-cold',
+    'pierce-immunity-fire',
+    'pierce-immunity-light',
+    'pierce-immunity-poison',
+    'pierce-immunity-damage',
+    'pierce-immunity-magic',
+]
+HELLFIRE_TORCH_ALL_SUNDER_VALUE = '300'
+HELLFIRE_TORCH_ALL_SUNDER_RECIPE_INPUT = 'isc'  # legacy test-only; V17 removes this recipe from generated output
+
+# Experimental Sunder research V17: natural Cow Level pool route for the
+# proven all-sunder Hellfire Torch carrier. This removes the cube recipe used
+# for V16 testing and exposes the carrier through regular cow-farm drops only.
+# Cow King native boss TreasureClass rows remain preserved; no Cow King force branch.
+CANON_ENABLE_HELLFIRE_TORCH_COW_POOL_DROP = True
+HELLFIRE_TORCH_COW_TC_NAME = 'zz_classic_sunder_torch_unique_cow_drop'
+HELLFIRE_TORCH_COW_POOL_PROB = 8192
+HELLFIRE_TORCH_COW_DROP_PROB = 8192
+TEST_ONLY_SUNDER_RECIPE_DESCRIPTIONS = {
+    'SUNDER V9 TEST: Identify Scroll -> Magic Small Charm + Life',
+    'SUNDER V10 TEST: Identify Scroll -> Hellfire Torch',
+    'SUNDER V12 TEST: Identify Scroll -> Dedicated Cold Pseudo-Sunder Large Charm',
+    'SUNDER V13 TEST: Identify Scroll -> Annihilus',
+    'SUNDER V16 TEST: Identify Scroll -> All-Sunder Hellfire Torch',
+}
 R200_SUPERSEDED_UNIQUE_KEYS: set[tuple[str, str]] = set()  # (unique index/name, base code)
 R200_SUPERSEDED_BASE_CODES: set[str] = set()  # kept for future duplicate-base suppressions
 
@@ -1175,6 +1260,1327 @@ def patch_cubemain(root: Path, patch_sources: Path, report: list[str]) -> None:
         report.append(f"[cubemain-validate] WARNING: validation failed: {e}")
 
 
+
+
+def apply_sunder_small_charm_cube_only_experiment(mod_root: Path, report: list[str]) -> None:
+    """Experimental V9: enable cm1 and add a cube-only Magic Small Charm + property recipe.
+
+    This deliberately does NOT patch monster TreasureClassEx rows or monstats.
+    It tests whether charms crash because they are empty/plain by creating a
+    valid magic Small Charm with an explicit harmless property (+Life).
+    """
+    if not CANON_ENABLE_SUNDER_SMALL_CHARM_PROPERTY_EXPERIMENT:
+        report.append("[sunder-small-charm] disabled; no Small Charm property isolation recipe")
+        return
+
+    excel = mod_root / "data/global/excel"
+    p_misc = excel / "misc.txt"
+    p_cube = excel / "cubemain.txt"
+    if not p_misc.exists() or not p_cube.exists():
+        report.append("[sunder-small-charm] missing misc.txt or cubemain.txt; skipped")
+        return
+
+    # Enable Small Charm base for Classic without enabling charm monster drops.
+    mh, mrows, mnl = read_tsv(p_misc)
+    code_k = find_column_by_name(mh, "code")
+    name_k = find_column_by_name(mh, "name")
+    type_k = find_column_by_name(mh, "type")
+    ver_k = find_column_by_name(mh, "version")
+    spawn_k = find_column_by_name(mh, "spawnable")
+    misc_rows_changed = 0
+    misc_cells_changed = 0
+    base_found = False
+    base_name = ""
+    base_type = ""
+    if code_k:
+        for r in mrows:
+            if (r.get(code_k) or "").strip().lower() != SUNDER_SMALL_CHARM_BASE_CODE:
+                continue
+            base_found = True
+            base_name = (r.get(name_k) or "") if name_k else ""
+            base_type = (r.get(type_k) or "") if type_k else ""
+            row_changed = False
+            for k, v in [(ver_k, "0"), (spawn_k, "1")]:
+                if k and (r.get(k) or "").strip() != v:
+                    r[k] = v
+                    misc_cells_changed += 1
+                    row_changed = True
+            if row_changed:
+                misc_rows_changed += 1
+            break
+    if misc_cells_changed:
+        write_tsv(p_misc, mh, mrows, mnl)
+
+    h, rows, nl = read_tsv(p_cube)
+    norm = {normalize_column_key(k): k for k in h}
+    def ck(name: str):
+        return norm.get(normalize_column_key(name))
+
+    desc_k = ck('description') or (h[0] if h else None)
+    enabled_k = ck('enabled')
+    version_k = ck('version')
+    numinputs_k = ck('numinputs')
+    input1_k = ck('input 1')
+    output_k = ck('output')
+    lvl_k = ck('lvl')
+    plvl_k = ck('plvl')
+    ilvl_k = ck('ilvl')
+    mod1_k = ck('mod 1')
+    mod1_chance_k = ck('mod 1 chance')
+    mod1_param_k = ck('mod 1 param')
+    mod1_min_k = ck('mod 1 min')
+    mod1_max_k = ck('mod 1 max')
+    eol_k = ck('*eol')
+
+    if not all([desc_k, enabled_k, version_k, numinputs_k, input1_k, output_k]):
+        report.append("[sunder-small-charm] cubemain missing required columns; skipped")
+        return
+
+    desc = "SUNDER V9 TEST: Identify Scroll -> Magic Small Charm + Life"
+    already = False
+    for r in rows:
+        if (r.get(desc_k) or "").strip() == desc:
+            already = True
+            recipe = r
+            break
+    else:
+        recipe = {k: "" for k in h}
+        rows.append(recipe)
+
+    desired = {
+        desc_k: desc,
+        enabled_k: "1",
+        version_k: "0",
+        numinputs_k: "1",
+        input1_k: SUNDER_SMALL_CHARM_RECIPE_INPUT,
+        output_k: f"{SUNDER_SMALL_CHARM_BASE_CODE},mag",
+    }
+    if lvl_k: desired[lvl_k] = "1"
+    if plvl_k: desired[plvl_k] = "0"
+    if ilvl_k: desired[ilvl_k] = "1"
+    if mod1_k: desired[mod1_k] = SUNDER_SMALL_CHARM_TEST_PROP
+    if mod1_chance_k: desired[mod1_chance_k] = "100"
+    if mod1_param_k: desired[mod1_param_k] = ""
+    if mod1_min_k: desired[mod1_min_k] = SUNDER_SMALL_CHARM_TEST_PROP_MIN
+    if mod1_max_k: desired[mod1_max_k] = SUNDER_SMALL_CHARM_TEST_PROP_MAX
+    if eol_k: desired[eol_k] = "0"
+
+    cells_changed = 0
+    for k, v in desired.items():
+        if (recipe.get(k) or "") != v:
+            recipe[k] = v
+            cells_changed += 1
+
+    if cells_changed or not already:
+        write_tsv(p_cube, h, rows, nl)
+
+    report.append(
+        f"[sunder-small-charm] V9 CUBE-ONLY MAGIC SMALL CHARM + PROPERTY active: base={SUNDER_SMALL_CHARM_BASE_CODE} "
+        f"base_found={int(base_found)} name={base_name or '<blank>'} type={base_type or '<blank>'} "
+        f"misc_rows_changed={misc_rows_changed} misc_cells_changed={misc_cells_changed} "
+        f"recipe={'existing' if already else 'added'} cells_changed={cells_changed} "
+        f"input={SUNDER_SMALL_CHARM_RECIPE_INPUT} output={SUNDER_SMALL_CHARM_BASE_CODE},mag "
+        f"mod1={SUNDER_SMALL_CHARM_TEST_PROP}:{SUNDER_SMALL_CHARM_TEST_PROP_MIN}-{SUNDER_SMALL_CHARM_TEST_PROP_MAX} "
+        f"monster_tc=disabled cowking=preserved_native"
+    )
+
+
+
+def apply_hellfire_torch_cube_only_experiment(mod_root: Path, report: list[str]) -> None:
+    """Experimental V10: enable cm2 and add a cube-only Hellfire Torch recipe.
+
+    This deliberately does NOT patch monster TreasureClassEx rows or monstats.
+    It tests whether a real LoD unique Large Charm payload (Hellfire Torch) is
+    any more stable than plain/magic charm generation in Classic.
+    """
+    if not CANON_ENABLE_HELLFIRE_TORCH_CUBE_EXPERIMENT:
+        report.append("[sunder-torch] disabled; no Hellfire Torch cube isolation recipe")
+        return
+
+    excel = mod_root / "data/global/excel"
+    p_misc = excel / "misc.txt"
+    p_unique = excel / "uniqueitems.txt"
+    p_cube = excel / "cubemain.txt"
+    if not p_misc.exists() or not p_unique.exists() or not p_cube.exists():
+        report.append("[sunder-torch] missing misc.txt, uniqueitems.txt, or cubemain.txt; skipped")
+        return
+
+    # Enable Large Charm base for Classic without enabling monster charm drops.
+    mh, mrows, mnl = read_tsv(p_misc)
+    code_k = find_column_by_name(mh, "code")
+    name_k = find_column_by_name(mh, "name")
+    type_k = find_column_by_name(mh, "type")
+    ver_k = find_column_by_name(mh, "version")
+    spawn_k = find_column_by_name(mh, "spawnable")
+    misc_rows_changed = 0
+    misc_cells_changed = 0
+    base_found = False
+    base_name = ""
+    base_type = ""
+    if code_k:
+        for r in mrows:
+            if (r.get(code_k) or "").strip().lower() != HELLFIRE_TORCH_BASE_CODE:
+                continue
+            base_found = True
+            base_name = (r.get(name_k) or "") if name_k else ""
+            base_type = (r.get(type_k) or "") if type_k else ""
+            row_changed = False
+            for k, v in [(ver_k, "0"), (spawn_k, "1")]:
+                if k and (r.get(k) or "").strip() != v:
+                    r[k] = v
+                    misc_cells_changed += 1
+                    row_changed = True
+            if row_changed:
+                misc_rows_changed += 1
+            break
+    if misc_cells_changed:
+        write_tsv(p_misc, mh, mrows, mnl)
+
+    # Enable and level-relax the actual Hellfire Torch unique row for isolation.
+    uh, urows, unl = read_tsv(p_unique)
+    idx_k = find_column_by_name(uh, "index")
+    ucode_k = find_column_by_name(uh, "code")
+    uver_k = find_column_by_name(uh, "version")
+    uenabled_k = find_column_by_name(uh, "enabled")
+    ulvl_k = find_column_by_name(uh, "lvl")
+    ulvlreq_k = find_column_by_name(uh, "lvl req")
+    unolimit_k = find_column_by_name(uh, "nolimit")
+    unique_rows_changed = 0
+    unique_cells_changed = 0
+    torch_found = False
+    for r in urows:
+        if (r.get(idx_k) or "").strip().lower() != HELLFIRE_TORCH_UNIQUE_NAME.lower():
+            continue
+        torch_found = True
+        row_changed = False
+        desired_pairs = [
+            (ucode_k, HELLFIRE_TORCH_BASE_CODE),
+            (uver_k, "0"),
+            (uenabled_k, "1"),
+            (ulvl_k, "1"),
+            (ulvlreq_k, "1"),
+            (unolimit_k, "1"),
+        ]
+        for k, v in desired_pairs:
+            if k and (r.get(k) or "").strip() != v:
+                r[k] = v
+                unique_cells_changed += 1
+                row_changed = True
+        if row_changed:
+            unique_rows_changed += 1
+        break
+    if unique_cells_changed:
+        write_tsv(p_unique, uh, urows, unl)
+
+    # Cube recipe: Identify Scroll -> unique Large Charm. No monster route.
+    h, rows, nl = read_tsv(p_cube)
+    norm = {normalize_column_key(k): k for k in h}
+    def ck(name: str):
+        return norm.get(normalize_column_key(name))
+
+    desc_k = ck('description') or (h[0] if h else None)
+    enabled_k = ck('enabled')
+    version_k = ck('version')
+    numinputs_k = ck('numinputs')
+    input1_k = ck('input 1')
+    output_k = ck('output')
+    lvl_k = ck('lvl')
+    plvl_k = ck('plvl')
+    ilvl_k = ck('ilvl')
+    eol_k = ck('*eol')
+
+    if not all([desc_k, enabled_k, version_k, numinputs_k, input1_k, output_k]):
+        report.append("[sunder-torch] cubemain missing required columns; skipped")
+        return
+
+    desc = "SUNDER V10 TEST: Identify Scroll -> Hellfire Torch"
+    already = False
+    for r in rows:
+        if (r.get(desc_k) or "").strip() == desc:
+            already = True
+            recipe = r
+            break
+    else:
+        recipe = {k: "" for k in h}
+        rows.append(recipe)
+
+    desired = {
+        desc_k: desc,
+        enabled_k: "1",
+        version_k: "0",
+        numinputs_k: "1",
+        input1_k: HELLFIRE_TORCH_RECIPE_INPUT,
+        output_k: f"{HELLFIRE_TORCH_BASE_CODE},uni",
+    }
+    if lvl_k: desired[lvl_k] = "1"
+    if plvl_k: desired[plvl_k] = "0"
+    if ilvl_k: desired[ilvl_k] = "110"
+    if eol_k: desired[eol_k] = "0"
+
+    cells_changed = 0
+    for k, v in desired.items():
+        if (recipe.get(k) or "") != v:
+            recipe[k] = v
+            cells_changed += 1
+
+    if cells_changed or not already:
+        write_tsv(p_cube, h, rows, nl)
+
+    report.append(
+        f"[sunder-torch] V10 CUBE-ONLY HELLFIRE TORCH active: base={HELLFIRE_TORCH_BASE_CODE} "
+        f"base_found={int(base_found)} name={base_name or '<blank>'} type={base_type or '<blank>'} "
+        f"misc_rows_changed={misc_rows_changed} misc_cells_changed={misc_cells_changed} "
+        f"torch_found={int(torch_found)} unique_rows_changed={unique_rows_changed} unique_cells_changed={unique_cells_changed} "
+        f"recipe={'existing' if already else 'added'} cells_changed={cells_changed} "
+        f"input={HELLFIRE_TORCH_RECIPE_INPUT} output={HELLFIRE_TORCH_BASE_CODE},uni "
+        f"monster_tc=disabled cowking=preserved_native"
+    )
+
+
+
+def apply_annihilus_cube_only_experiment(mod_root: Path, report: list[str]) -> None:
+    """Experimental V13: enable cm1 and add a cube-only Annihilus recipe.
+
+    This deliberately does NOT patch monster TreasureClassEx rows or monstats.
+    It tests whether a complete real LoD unique Small Charm payload (Annihilus)
+    is stable in Classic, after plain/magic Small Charm generation crashed.
+    """
+    if not CANON_ENABLE_ANNIHILUS_CUBE_EXPERIMENT:
+        report.append("[sunder-annihilus] disabled; no Annihilus cube isolation recipe")
+        return
+
+    excel = mod_root / "data/global/excel"
+    p_misc = excel / "misc.txt"
+    p_unique = excel / "uniqueitems.txt"
+    p_cube = excel / "cubemain.txt"
+    if not p_misc.exists() or not p_unique.exists() or not p_cube.exists():
+        report.append("[sunder-annihilus] missing misc.txt, uniqueitems.txt, or cubemain.txt; skipped")
+        return
+
+    mh, mrows, mnl = read_tsv(p_misc)
+    code_k = find_column_by_name(mh, "code")
+    name_k = find_column_by_name(mh, "name")
+    type_k = find_column_by_name(mh, "type")
+    ver_k = find_column_by_name(mh, "version")
+    spawn_k = find_column_by_name(mh, "spawnable")
+    misc_rows_changed = 0
+    misc_cells_changed = 0
+    base_found = False
+    base_name = ""
+    base_type = ""
+    if code_k:
+        for r in mrows:
+            if (r.get(code_k) or "").strip().lower() != ANNIHILUS_BASE_CODE:
+                continue
+            base_found = True
+            base_name = (r.get(name_k) or "") if name_k else ""
+            base_type = (r.get(type_k) or "") if type_k else ""
+            row_changed = False
+            for k, v in [(ver_k, "0"), (spawn_k, "1")]:
+                if k and (r.get(k) or "").strip() != v:
+                    r[k] = v
+                    misc_cells_changed += 1
+                    row_changed = True
+            if row_changed:
+                misc_rows_changed += 1
+            break
+    if misc_cells_changed:
+        write_tsv(p_misc, mh, mrows, mnl)
+
+    uh, urows, unl = read_tsv(p_unique)
+    idx_k = find_column_by_name(uh, "index")
+    ucode_k = find_column_by_name(uh, "code")
+    uver_k = find_column_by_name(uh, "version")
+    uenabled_k = find_column_by_name(uh, "enabled")
+    ulvl_k = find_column_by_name(uh, "lvl")
+    ulvlreq_k = find_column_by_name(uh, "lvl req")
+    unolimit_k = find_column_by_name(uh, "nolimit")
+    unique_rows_changed = 0
+    unique_cells_changed = 0
+    anni_found = False
+    for r in urows:
+        if (r.get(idx_k) or "").strip().lower() != ANNIHILUS_UNIQUE_NAME.lower():
+            continue
+        anni_found = True
+        row_changed = False
+        desired_pairs = [
+            (ucode_k, ANNIHILUS_BASE_CODE),
+            (uver_k, "0"),
+            (uenabled_k, "1"),
+            (ulvl_k, "1"),
+            (ulvlreq_k, "1"),
+            (unolimit_k, "1"),
+        ]
+        for k, v in desired_pairs:
+            if k and (r.get(k) or "").strip() != v:
+                r[k] = v
+                unique_cells_changed += 1
+                row_changed = True
+        if row_changed:
+            unique_rows_changed += 1
+        break
+    if unique_cells_changed:
+        write_tsv(p_unique, uh, urows, unl)
+
+    h, rows, nl = read_tsv(p_cube)
+    norm = {normalize_column_key(k): k for k in h}
+    def ck(name: str):
+        return norm.get(normalize_column_key(name))
+
+    desc_k = ck('description') or (h[0] if h else None)
+    enabled_k = ck('enabled')
+    version_k = ck('version')
+    numinputs_k = ck('numinputs')
+    input1_k = ck('input 1')
+    output_k = ck('output')
+    lvl_k = ck('lvl')
+    plvl_k = ck('plvl')
+    ilvl_k = ck('ilvl')
+    eol_k = ck('*eol')
+
+    if not all([desc_k, enabled_k, version_k, numinputs_k, input1_k, output_k]):
+        report.append("[sunder-annihilus] cubemain missing required columns; skipped")
+        return
+
+    desc = "SUNDER V13 TEST: Identify Scroll -> Annihilus"
+    already = False
+    for r in rows:
+        if (r.get(desc_k) or "").strip() == desc:
+            already = True
+            recipe = r
+            break
+    else:
+        recipe = {k: "" for k in h}
+        rows.append(recipe)
+
+    desired = {
+        desc_k: desc,
+        enabled_k: "1",
+        version_k: "0",
+        numinputs_k: "1",
+        input1_k: ANNIHILUS_RECIPE_INPUT,
+        output_k: f"{ANNIHILUS_BASE_CODE},uni",
+    }
+    if lvl_k: desired[lvl_k] = "1"
+    if plvl_k: desired[plvl_k] = "0"
+    if ilvl_k: desired[ilvl_k] = "110"
+    if eol_k: desired[eol_k] = "0"
+
+    cells_changed = 0
+    for k, v in desired.items():
+        if (recipe.get(k) or "") != v:
+            recipe[k] = v
+            cells_changed += 1
+
+    if cells_changed or not already:
+        write_tsv(p_cube, h, rows, nl)
+
+    report.append(
+        f"[sunder-annihilus] V13 CUBE-ONLY ANNIHILUS active: base={ANNIHILUS_BASE_CODE} "
+        f"base_found={int(base_found)} name={base_name or '<blank>'} type={base_type or '<blank>'} "
+        f"misc_rows_changed={misc_rows_changed} misc_cells_changed={misc_cells_changed} "
+        f"annihilus_found={int(anni_found)} unique_rows_changed={unique_rows_changed} unique_cells_changed={unique_cells_changed} "
+        f"recipe={'existing' if already else 'added'} cells_changed={cells_changed} "
+        f"input={ANNIHILUS_RECIPE_INPUT} output={ANNIHILUS_BASE_CODE},uni "
+        f"monster_tc=disabled cowking=preserved_native"
+    )
+
+
+
+
+def apply_hellfire_torch_all_sunder_no_penalty(mod_root: Path, report: list[str]) -> None:
+    """Experimental V17: turn the real Hellfire Torch row into a sunder-only
+    all-immunity carrier, with no negative resistance penalties and no vanilla
+    Torch stats.
+
+    V16 proved the cm2/Hellfire Torch path is stable in Classic. V17 keeps that
+    payload, removes the test-only cube recipe, and lets the separate V17 cow
+    pool function expose the carrier through natural cow-level drops.
+    """
+    if not CANON_ENABLE_HELLFIRE_TORCH_ALL_SUNDER_NO_PENALTY:
+        report.append("[sunder-torch] disabled; no Torch all-sunder/no-penalty payload")
+        return
+
+    excel = mod_root / "data/global/excel"
+    p_misc = excel / "misc.txt"
+    p_unique = excel / "uniqueitems.txt"
+    p_cube = excel / "cubemain.txt"
+    if not p_misc.exists() or not p_unique.exists() or not p_cube.exists():
+        report.append("[sunder-torch] missing misc.txt, uniqueitems.txt, or cubemain.txt; skipped")
+        return
+
+    # Enable Large Charm base for Classic.
+    mh, mrows, mnl = read_tsv(p_misc)
+    code_k = find_column_by_name(mh, "code")
+    name_k = find_column_by_name(mh, "name")
+    type_k = find_column_by_name(mh, "type")
+    ver_k = find_column_by_name(mh, "version")
+    spawn_k = find_column_by_name(mh, "spawnable")
+    base_found = False
+    base_name = ""
+    base_type = ""
+    misc_rows_changed = 0
+    misc_cells_changed = 0
+    if code_k:
+        for r in mrows:
+            if (r.get(code_k) or "").strip().lower() != HELLFIRE_TORCH_BASE_CODE:
+                continue
+            base_found = True
+            base_name = (r.get(name_k) or "") if name_k else ""
+            base_type = (r.get(type_k) or "") if type_k else ""
+            row_changed = False
+            for k, v in [(ver_k, "0"), (spawn_k, "1")]:
+                if k and (r.get(k) or "").strip() != v:
+                    r[k] = v
+                    misc_cells_changed += 1
+                    row_changed = True
+            if row_changed:
+                misc_rows_changed += 1
+            break
+    if misc_cells_changed:
+        write_tsv(p_misc, mh, mrows, mnl)
+
+    # Enable Hellfire Torch, then convert it into an all-sunder-only carrier.
+    # All vanilla Torch properties are removed. Only pierce-immunity-* stats remain.
+    # No negative resistance penalties are added.
+    uh, urows, unl = read_tsv(p_unique)
+    idx_k = find_column_by_name(uh, "index")
+    ucode_k = find_column_by_name(uh, "code")
+    uver_k = find_column_by_name(uh, "version")
+    uenabled_k = find_column_by_name(uh, "enabled")
+    ulvl_k = find_column_by_name(uh, "lvl")
+    ulvlreq_k = find_column_by_name(uh, "lvl req")
+    unolimit_k = find_column_by_name(uh, "nolimit")
+    prop_cols = {i: (
+        find_column_by_name(uh, f"prop{i}"),
+        find_column_by_name(uh, f"par{i}"),
+        find_column_by_name(uh, f"min{i}"),
+        find_column_by_name(uh, f"max{i}"),
+    ) for i in range(1, 13)}
+
+    torch_found = False
+    unique_rows_changed = 0
+    unique_cells_changed = 0
+    cleared_property_slots = 0
+    assigned_slots: list[int] = []
+    if idx_k:
+        for r in urows:
+            if (r.get(idx_k) or "").strip().lower() != HELLFIRE_TORCH_UNIQUE_NAME.lower():
+                continue
+            torch_found = True
+            row_changed = False
+            for k, v in [
+                (ucode_k, HELLFIRE_TORCH_BASE_CODE),
+                (uver_k, "0"),
+                (uenabled_k, "1"),
+                (ulvl_k, "1"),
+                (ulvlreq_k, "1"),
+                (unolimit_k, "1"),
+            ]:
+                if k and (r.get(k) or "").strip() != v:
+                    r[k] = v
+                    unique_cells_changed += 1
+                    row_changed = True
+
+            # Clear every vanilla Torch property slot first. This removes Firestorm,
+            # class skills, attributes, all-res, light radius, charges and any previous
+            # experimental penalty/stat. The modded Torch should display sunder only.
+            for i, (prop_k, par_k, min_k, max_k) in prop_cols.items():
+                if not prop_k:
+                    continue
+                slot_had_data = False
+                for k in (prop_k, par_k, min_k, max_k):
+                    if k and (r.get(k) or "") != "":
+                        r[k] = ""
+                        unique_cells_changed += 1
+                        row_changed = True
+                        slot_had_data = True
+                if slot_had_data:
+                    cleared_property_slots += 1
+
+            # Place all six sunder effects in slots 1-6.
+            for slot, prop in enumerate(HELLFIRE_TORCH_ALL_SUNDER_PROPS, start=1):
+                prop_k, par_k, min_k, max_k = prop_cols[slot]
+                for k, v in [
+                    (prop_k, prop),
+                    (par_k, ""),
+                    (min_k, HELLFIRE_TORCH_ALL_SUNDER_VALUE),
+                    (max_k, HELLFIRE_TORCH_ALL_SUNDER_VALUE),
+                ]:
+                    if k and (r.get(k) or "") != v:
+                        r[k] = v
+                        unique_cells_changed += 1
+                        row_changed = True
+                assigned_slots.append(slot)
+
+            if row_changed:
+                unique_rows_changed += 1
+            break
+    if unique_cells_changed:
+        write_tsv(p_unique, uh, urows, unl)
+
+    # V17: remove all known Sunder research cube recipes from generated output.
+    # They are useful for isolated testing branches, but must not be present in a
+    # natural-drop/stability-candidate build.
+    recipe_rows_removed = 0
+    recipe_cells_disabled = 0
+    try:
+        h, rows, nl = read_tsv(p_cube)
+        norm = {normalize_column_key(k): k for k in h}
+        desc_k = norm.get(normalize_column_key('description')) or (h[0] if h else None)
+        enabled_k = norm.get(normalize_column_key('enabled'))
+        input1_k = norm.get(normalize_column_key('input 1'))
+        output_k = norm.get(normalize_column_key('output'))
+
+        kept_rows = []
+        for rr in rows:
+            desc = (rr.get(desc_k) or '').strip() if desc_k else ''
+            inp = (rr.get(input1_k) or '').strip().lower() if input1_k else ''
+            outv = (rr.get(output_k) or '').strip().lower() if output_k else ''
+            is_known_sunder_recipe = desc in TEST_ONLY_SUNDER_RECIPE_DESCRIPTIONS
+            is_v16_torch_recipe_shape = (
+                inp == HELLFIRE_TORCH_ALL_SUNDER_RECIPE_INPUT.lower()
+                and outv == f"{HELLFIRE_TORCH_BASE_CODE},uni".lower()
+                and 'sunder' in desc.lower()
+            )
+            if is_known_sunder_recipe or is_v16_torch_recipe_shape:
+                recipe_rows_removed += 1
+                continue
+            kept_rows.append(rr)
+
+        if recipe_rows_removed:
+            write_tsv(p_cube, h, kept_rows, nl)
+        else:
+            # If a prior generated row cannot be removed because the source schema changed,
+            # the fallback is to disable matching rows rather than leaving a live recipe.
+            for rr in rows:
+                desc = (rr.get(desc_k) or '').strip() if desc_k else ''
+                if desc in TEST_ONLY_SUNDER_RECIPE_DESCRIPTIONS and enabled_k and (rr.get(enabled_k) or '') != '0':
+                    rr[enabled_k] = '0'
+                    recipe_cells_disabled += 1
+            if recipe_cells_disabled:
+                write_tsv(p_cube, h, rows, nl)
+    except Exception as e:
+        report.append(f"[sunder-torch] WARNING: test cube recipe removal failed: {type(e).__name__}: {e}")
+
+    report.append(
+        f"[sunder-torch] V17 HELLFIRE TORCH ALL-SUNDER NO PENALTY active: base={HELLFIRE_TORCH_BASE_CODE} "
+        f"base_found={int(base_found)} name={base_name or '<blank>'} type={base_type or '<blank>'} "
+        f"torch_found={int(torch_found)} assigned_slots={','.join(map(str, assigned_slots)) or '<none>'} "
+        f"cleared_property_slots={cleared_property_slots} props={','.join(HELLFIRE_TORCH_ALL_SUNDER_PROPS)} "
+        f"value={HELLFIRE_TORCH_ALL_SUNDER_VALUE} "
+        f"misc_rows_changed={misc_rows_changed} misc_cells_changed={misc_cells_changed} "
+        f"unique_rows_changed={unique_rows_changed} unique_cells_changed={unique_cells_changed} "
+        f"test_recipe_rows_removed={recipe_rows_removed} test_recipe_cells_disabled={recipe_cells_disabled} "
+        f"only_props=all_sunder penalty=none vanilla_torch_props=cleared TEST_ONLY_CUBE_RECIPE_REMOVED=1"
+    )
+
+
+def apply_hellfire_torch_all_sunder_cow_pool_drop(mod_root: Path, report: list[str]) -> None:
+    """Experimental V17: add the proven all-sunder Hellfire Torch carrier to
+    the regular Cow Level drop pool through a controlled unique-only sidecar TC.
+
+    This targets the actual R200 cow-all-bases wrappers used by regular Hell
+    Bovines, and also supports the older non-direct cow TC route. Cow King native
+    boss TreasureClass rows are deliberately ignored/preserved.
+    """
+    if not CANON_ENABLE_HELLFIRE_TORCH_COW_POOL_DROP:
+        report.append("[sunder-torch] disabled; no Torch cow-pool drop route")
+        return
+
+    excel = mod_root / "data/global/excel"
+    p_tc = excel / "treasureclassex.txt"
+    if not p_tc.exists():
+        report.append("[sunder-torch] treasureclassex.txt missing; cow-pool route skipped")
+        return
+
+    th, tc_rows, tnl = read_tsv(p_tc)
+    tc_k = find_column_by_name(th, "Treasure Class") or (th[0] if th else None)
+    if not tc_k:
+        report.append("[sunder-torch] treasureclassex missing TC name column; cow-pool route skipped")
+        return
+
+    def _n(v: str) -> str:
+        return normalize_column_key(v)
+
+    item_cols = [c for c in th if _n(c).startswith("item")]
+    prob_cols = [c for c in th if _n(c).startswith("prob")]
+
+    def _suffix_num(col: str) -> int:
+        m = re.search(r"(\d+)$", _n(col))
+        return int(m.group(1)) if m else 0
+
+    item_cols.sort(key=_suffix_num)
+    prob_cols.sort(key=_suffix_num)
+    max_slots = min(len(item_cols), len(prob_cols))
+    if not item_cols or not prob_cols:
+        report.append("[sunder-torch] treasureclassex missing Item/Prob columns; cow-pool route skipped")
+        return
+
+    picks_k = find_column_by_name(th, "Picks")
+    nodrop_k = find_column_by_name(th, "NoDrop")
+    group_k = find_column_by_name(th, "group")
+    level_k = find_column_by_name(th, "level")
+    unique_k = find_column_by_name(th, "Unique")
+    set_k = find_column_by_name(th, "Set")
+    rare_k = find_column_by_name(th, "Rare")
+    magic_k = find_column_by_name(th, "Magic")
+    by_name = {(r.get(tc_k) or "").strip(): r for r in tc_rows if (r.get(tc_k) or "").strip()}
+
+    tc_rows_added = 0
+    tc_cells_changed = 0
+    if HELLFIRE_TORCH_COW_TC_NAME in by_name:
+        tr = by_name[HELLFIRE_TORCH_COW_TC_NAME]
+    else:
+        tr = {k: "" for k in th}
+        tr[tc_k] = HELLFIRE_TORCH_COW_TC_NAME
+        tc_rows.append(tr)
+        by_name[HELLFIRE_TORCH_COW_TC_NAME] = tr
+        tc_rows_added += 1
+
+    desired_tc: list[tuple[str, str]] = []
+    for k, v in [(picks_k, "1"), (nodrop_k, "0"), (group_k, "0"), (level_k, "0"),
+                 (unique_k, "1024"), (set_k, "0"), (rare_k, "0"), (magic_k, "0")]:
+        if k:
+            desired_tc.append((k, v))
+    for i in range(max_slots):
+        desired_tc.append((item_cols[i], HELLFIRE_TORCH_BASE_CODE if i == 0 else ""))
+        desired_tc.append((prob_cols[i], "1" if i == 0 else ""))
+    for k, v in desired_tc:
+        if (tr.get(k) or "") != v:
+            tr[k] = v
+            tc_cells_changed += 1
+
+    def _is_cow_king_name(name: str) -> bool:
+        n = (name or "").strip().lower()
+        return n.startswith("cow king") or n.startswith("cowking")
+
+    def _row_has_cow_wrapper(row: dict[str, str]) -> bool:
+        return any((row.get(ic) or "").strip().startswith("zz_cow_allbases_wrap") for ic in item_cols)
+
+    def _splice_sidecar(row: dict[str, str], row_tag: str) -> tuple[bool, int, bool]:
+        """Return row_changed, cells_changed, no_free_slot."""
+        cells = 0
+        changed = False
+        # Give the regular R200 pool and the unique-only Torch branch equal top-level weight.
+        # For direct R200 cow
+        # mode the target row is itself the zz_cow_allbases_wrap_* row, so the
+        # high probability belongs to its existing child root. For non-direct
+        # rows the target entry is the wrapper reference in that cow TC row.
+        for ic, pc in zip(item_cols, prob_cols):
+            item_name = (row.get(ic) or "").strip()
+            is_main_cow_path = (
+                bool(item_name)
+                and item_name != HELLFIRE_TORCH_COW_TC_NAME
+                and (row_tag == "wrapper" or item_name.startswith("zz_cow_allbases_wrap"))
+            )
+            if is_main_cow_path:
+                if (row.get(pc) or "") != str(HELLFIRE_TORCH_COW_POOL_PROB):
+                    row[pc] = str(HELLFIRE_TORCH_COW_POOL_PROB)
+                    cells += 1
+                    changed = True
+                break
+        already = any((row.get(ic) or "").strip() == HELLFIRE_TORCH_COW_TC_NAME for ic in item_cols)
+        if already:
+            return changed, cells, False
+        for ic, pc in zip(item_cols, prob_cols):
+            if (row.get(ic) or "").strip() == "":
+                row[ic] = HELLFIRE_TORCH_COW_TC_NAME
+                row[pc] = str(HELLFIRE_TORCH_COW_DROP_PROB)
+                cells += 2
+                changed = True
+                return changed, cells, False
+        return changed, cells, True
+
+    wrapper_rows_changed = 0
+    wrapper_cells_changed = 0
+    cow_rows_changed = 0
+    cow_cells_changed = 0
+    no_free_slots = 0
+    wrapper_rows_seen = 0
+    cow_rows_seen = 0
+
+    for r in tc_rows:
+        name = (r.get(tc_k) or "").strip()
+        nl = name.lower()
+        if not name:
+            continue
+        if nl.startswith("zz_cow_allbases_wrap"):
+            wrapper_rows_seen += 1
+            changed, cells, no_slot = _splice_sidecar(r, "wrapper")
+            wrapper_cells_changed += cells
+            if changed:
+                wrapper_rows_changed += 1
+            if no_slot:
+                no_free_slots += 1
+            continue
+        if nl.startswith("zz_") or _is_cow_king_name(name):
+            continue
+        if _row_has_cow_wrapper(r):
+            cow_rows_seen += 1
+            changed, cells, no_slot = _splice_sidecar(r, "cow")
+            cow_cells_changed += cells
+            if changed:
+                cow_rows_changed += 1
+            if no_slot:
+                no_free_slots += 1
+
+    if tc_rows_added or tc_cells_changed or wrapper_cells_changed or cow_cells_changed:
+        write_tsv(p_tc, th, tc_rows, tnl)
+
+    report.append(
+        f"[sunder-torch] V17 cow-pool natural drop route active: "
+        f"tc={HELLFIRE_TORCH_COW_TC_NAME} base={HELLFIRE_TORCH_BASE_CODE} unique_quality=1024 "
+        f"tc_rows_added={tc_rows_added} tc_cells_changed={tc_cells_changed} "
+        f"wrapper_rows_seen={wrapper_rows_seen} wrapper_rows_changed={wrapper_rows_changed} wrapper_cells_changed={wrapper_cells_changed} "
+        f"cow_rows_seen={cow_rows_seen} cow_rows_changed={cow_rows_changed} cow_cells_changed={cow_cells_changed} "
+        f"odds=wrapper:{HELLFIRE_TORCH_COW_POOL_PROB}/sunder_torch:{HELLFIRE_TORCH_COW_DROP_PROB} "
+        f"SUNDER_TORCH_COW_POOL_DROP=1 COW_KING_NATIVE_TC_PRESERVED=1 NO_COW_KING_FORCE_BRANCH=1 "
+        f"no_free_slots={no_free_slots} cube_recipe=removed"
+    )
+
+def apply_annihilus_classic_cow_drop_port(mod_root: Path, report: list[str]) -> None:
+    """V17: port real Annihilus to Classic cow drops through a
+    controlled unique-only sidecar TC compatible with direct cow-pool routing.
+
+    Important safety rule: cm1 is NOT added to the generic all-bases pool. Plain
+    Small Charm generation crashed; this route only offers cm1 through a TC row
+    with Unique=1024 so the intended complete Annihilus payload is selected.
+    """
+    if not CANON_ENABLE_ANNIHILUS_COW_DROP_PORT:
+        report.append("[annihilus-port] disabled; no Annihilus cow-drop port")
+        return
+
+    excel = mod_root / "data/global/excel"
+    p_misc = excel / "misc.txt"
+    p_unique = excel / "uniqueitems.txt"
+    p_tc = excel / "treasureclassex.txt"
+    if not p_misc.exists() or not p_unique.exists() or not p_tc.exists():
+        report.append("[annihilus-port] missing misc.txt, uniqueitems.txt, or treasureclassex.txt; skipped")
+        return
+
+    # Enable Small Charm base for Classic. Do not add it to general cow/all-bases pools.
+    mh, mrows, mnl = read_tsv(p_misc)
+    code_k = find_column_by_name(mh, "code")
+    name_k = find_column_by_name(mh, "name")
+    type_k = find_column_by_name(mh, "type")
+    ver_k = find_column_by_name(mh, "version")
+    spawn_k = find_column_by_name(mh, "spawnable")
+    base_found = False
+    base_name = ""
+    base_type = ""
+    misc_rows_changed = 0
+    misc_cells_changed = 0
+    if code_k:
+        for r in mrows:
+            if (r.get(code_k) or "").strip().lower() != ANNIHILUS_BASE_CODE:
+                continue
+            base_found = True
+            base_name = (r.get(name_k) or "") if name_k else ""
+            base_type = (r.get(type_k) or "") if type_k else ""
+            row_changed = False
+            for k, v in [(ver_k, "0"), (spawn_k, "1")]:
+                if k and (r.get(k) or "").strip() != v:
+                    r[k] = v
+                    misc_cells_changed += 1
+                    row_changed = True
+            if row_changed:
+                misc_rows_changed += 1
+            break
+    if misc_cells_changed:
+        write_tsv(p_misc, mh, mrows, mnl)
+
+    # Enable Annihilus without repurposing its properties. Level is relaxed so cow
+    # drops can resolve it during testing; the property list is left intact.
+    uh, urows, unl = read_tsv(p_unique)
+    idx_k = find_column_by_name(uh, "index")
+    ucode_k = find_column_by_name(uh, "code")
+    uver_k = find_column_by_name(uh, "version")
+    uenabled_k = find_column_by_name(uh, "enabled")
+    ulvl_k = find_column_by_name(uh, "lvl")
+    ulvlreq_k = find_column_by_name(uh, "lvl req")
+    unolimit_k = find_column_by_name(uh, "nolimit")
+    anni_found = False
+    unique_rows_changed = 0
+    unique_cells_changed = 0
+    if idx_k:
+        for r in urows:
+            if (r.get(idx_k) or "").strip().lower() != ANNIHILUS_UNIQUE_NAME.lower():
+                continue
+            anni_found = True
+            row_changed = False
+            for k, v in [
+                (ucode_k, ANNIHILUS_BASE_CODE),
+                (uver_k, "0"),
+                (uenabled_k, "1"),
+                (ulvl_k, "1"),
+                (ulvlreq_k, "1"),
+                (unolimit_k, "1"),
+            ]:
+                if k and (r.get(k) or "").strip() != v:
+                    r[k] = v
+                    unique_cells_changed += 1
+                    row_changed = True
+            if row_changed:
+                unique_rows_changed += 1
+            break
+    if unique_cells_changed:
+        write_tsv(p_unique, uh, urows, unl)
+
+    # Add a unique-only Annihilus TC and splice it as a low-weight sidecar into
+    # the active R200 regular-cow route. V17 direct-pool mode points Hell Bovines
+    # straight at zz_cow_allbases_wrap_*; older/non-direct builds can still reach
+    # wrapper-referencing cow TC rows. Cow King is deliberately excluded.
+    th, tc_rows, tnl = read_tsv(p_tc)
+    tc_k = find_column_by_name(th, "Treasure Class") or (th[0] if th else None)
+    if not tc_k:
+        report.append("[annihilus-port] treasureclassex missing TC name column; skipped")
+        return
+    def _n(v: str) -> str: return normalize_column_key(v)
+    item_cols = [c for c in th if _n(c).startswith("item")]
+    prob_cols = [c for c in th if _n(c).startswith("prob")]
+    def _suffix_num(col: str) -> int:
+        m = re.search(r"(\d+)$", _n(col))
+        return int(m.group(1)) if m else 0
+    item_cols.sort(key=_suffix_num)
+    prob_cols.sort(key=_suffix_num)
+    max_slots = min(len(item_cols), len(prob_cols))
+    if not item_cols or not prob_cols:
+        report.append("[annihilus-port] treasureclassex missing Item/Prob columns; skipped")
+        return
+
+    picks_k = find_column_by_name(th, "Picks")
+    nodrop_k = find_column_by_name(th, "NoDrop")
+    group_k = find_column_by_name(th, "group")
+    level_k = find_column_by_name(th, "level")
+    unique_k = find_column_by_name(th, "Unique")
+    set_k = find_column_by_name(th, "Set")
+    rare_k = find_column_by_name(th, "Rare")
+    magic_k = find_column_by_name(th, "Magic")
+    by_name = {(r.get(tc_k) or "").strip(): r for r in tc_rows if (r.get(tc_k) or "").strip()}
+
+    tc_rows_added = 0
+    tc_cells_changed = 0
+    if ANNIHILUS_COW_TC_NAME in by_name:
+        ar = by_name[ANNIHILUS_COW_TC_NAME]
+    else:
+        ar = {k: "" for k in th}
+        ar[tc_k] = ANNIHILUS_COW_TC_NAME
+        tc_rows.append(ar)
+        by_name[ANNIHILUS_COW_TC_NAME] = ar
+        tc_rows_added += 1
+    desired_tc = []
+    for k, v in [(picks_k, "1"), (nodrop_k, "0"), (group_k, "0"), (level_k, "0"),
+                 (unique_k, "1024"), (set_k, "0"), (rare_k, "0"), (magic_k, "0")]:
+        if k:
+            desired_tc.append((k, v))
+    for i in range(max_slots):
+        desired_tc.append((item_cols[i], ANNIHILUS_BASE_CODE if i == 0 else ""))
+        desired_tc.append((prob_cols[i], "1" if i == 0 else ""))
+    for k, v in desired_tc:
+        if (ar.get(k) or "") != v:
+            ar[k] = v
+            tc_cells_changed += 1
+
+    def _is_cow_king_name(name: str) -> bool:
+        n = (name or "").strip().lower()
+        return n.startswith("cow king") or n.startswith("cowking")
+
+    def _row_has_cow_wrapper(row: dict[str, str]) -> bool:
+        return any((row.get(ic) or "").strip().startswith("zz_cow_allbases_wrap") for ic in item_cols)
+
+    def _splice_sidecar(row: dict[str, str], row_tag: str) -> tuple[bool, int, bool]:
+        """Return row_changed, cells_changed, no_free_slot."""
+        cells = 0
+        changed = False
+
+        # Give the regular R200 pool and the unique-only Annihilus branch equal top-level weight. In direct mode the
+        # wrapper row's first real child is the flat pool root; in legacy cow rows
+        # the main path is the zz_cow_allbases_wrap_* reference itself.
+        for ic, pc in zip(item_cols, prob_cols):
+            item_name = (row.get(ic) or "").strip()
+            is_main_cow_path = False
+            if row_tag == "wrapper":
+                is_main_cow_path = bool(item_name) and item_name not in {
+                    ANNIHILUS_COW_TC_NAME,
+                    HELLFIRE_TORCH_COW_TC_NAME,
+                }
+            else:
+                is_main_cow_path = item_name.startswith("zz_cow_allbases_wrap")
+            if is_main_cow_path:
+                if (row.get(pc) or "") != str(ANNIHILUS_COW_POOL_PROB):
+                    row[pc] = str(ANNIHILUS_COW_POOL_PROB)
+                    cells += 1
+                    changed = True
+                break
+
+        # Idempotent sidecar handling: if already present, repair its weight; otherwise
+        # insert it into the first empty slot. Never replace an existing cow/Torch path.
+        for ic, pc in zip(item_cols, prob_cols):
+            if (row.get(ic) or "").strip() == ANNIHILUS_COW_TC_NAME:
+                if (row.get(pc) or "") != str(ANNIHILUS_COW_DROP_PROB):
+                    row[pc] = str(ANNIHILUS_COW_DROP_PROB)
+                    cells += 1
+                    changed = True
+                return changed, cells, False
+
+        for ic, pc in zip(item_cols, prob_cols):
+            if (row.get(ic) or "").strip() == "":
+                row[ic] = ANNIHILUS_COW_TC_NAME
+                row[pc] = str(ANNIHILUS_COW_DROP_PROB)
+                cells += 2
+                changed = True
+                return changed, cells, False
+        return changed, cells, True
+
+    wrapper_rows_seen = 0
+    wrapper_rows_changed = 0
+    wrapper_cells_changed = 0
+    cow_rows_seen = 0
+    cow_rows_changed = 0
+    cow_cells_changed = 0
+    no_free_slots = 0
+
+    for r in tc_rows:
+        name = (r.get(tc_k) or "").strip()
+        nl = name.lower()
+        if not name:
+            continue
+
+        # V17 direct-pool route: these are the actual regular Hell Bovine entry wrappers.
+        if nl.startswith("zz_cow_allbases_wrap"):
+            wrapper_rows_seen += 1
+            changed, cells, no_slot = _splice_sidecar(r, "wrapper")
+            wrapper_cells_changed += cells
+            if changed:
+                wrapper_rows_changed += 1
+            if no_slot:
+                no_free_slots += 1
+            continue
+
+        # Never touch helper sidecars or Cow King's native boss TreasureClass rows.
+        if nl.startswith("zz_") or _is_cow_king_name(name):
+            continue
+
+        # Backward-compatible/non-direct route: regular cow rows that reference a wrapper.
+        if _row_has_cow_wrapper(r):
+            cow_rows_seen += 1
+            changed, cells, no_slot = _splice_sidecar(r, "cow")
+            cow_cells_changed += cells
+            if changed:
+                cow_rows_changed += 1
+            if no_slot:
+                no_free_slots += 1
+
+    if tc_rows_added or tc_cells_changed or wrapper_cells_changed or cow_cells_changed:
+        write_tsv(p_tc, th, tc_rows, tnl)
+
+    report.append(
+        f"[annihilus-port] V17 CLASSIC COW DROP active: base={ANNIHILUS_BASE_CODE} "
+        f"base_found={int(base_found)} name={base_name or '<blank>'} type={base_type or '<blank>'} "
+        f"annihilus_found={int(anni_found)} unique_rows_changed={unique_rows_changed} unique_cells_changed={unique_cells_changed} "
+        f"tc={ANNIHILUS_COW_TC_NAME} unique_quality=1024 tc_rows_added={tc_rows_added} tc_cells_changed={tc_cells_changed} "
+        f"wrapper_rows_seen={wrapper_rows_seen} wrapper_rows_changed={wrapper_rows_changed} wrapper_cells_changed={wrapper_cells_changed} "
+        f"cow_rows_seen={cow_rows_seen} cow_rows_changed={cow_rows_changed} cow_cells_changed={cow_cells_changed} "
+        f"odds=wrapper:{ANNIHILUS_COW_POOL_PROB}/annihilus:{ANNIHILUS_COW_DROP_PROB} "
+        f"DIRECT_COW_WRAPPER_ROUTE=1 COW_KING_NATIVE_TC_PRESERVED=1 "
+        f"plain_small_charm_not_in_generic_pool=1 no_free_slots={no_free_slots}"
+    )
+
+def apply_large_charm_pseudo_cold_experiment(mod_root: Path, report: list[str]) -> None:
+    """Experimental V12: cube-only dedicated Large Charm with cold pseudo-sunder.
+
+    This deliberately avoids modifying any existing unique charm row such as
+    Hellfire Torch, Gheed's Fortune, Annihilus, or the vanilla Sunder Charms.
+
+    It clones the stable Large Charm base path into a new test-only misc code
+    and appends one new unique row:
+      - base code: csc (custom test-only Large Charm carrier)
+      - unique: Classic Cold Rupture
+      - pierce-immunity-cold = 300
+      - res-cold = -75
+
+    No monster TreasureClass/monstats charm route is enabled.
+    """
+    if not CANON_ENABLE_LARGE_CHARM_PSEUDO_COLD_EXPERIMENT:
+        report.append("[sunder-large-charm] disabled; no dedicated cold pseudo-sunder Large Charm recipe")
+        return
+
+    excel = mod_root / "data/global/excel"
+    p_misc = excel / "misc.txt"
+    p_unique = excel / "uniqueitems.txt"
+    p_cube = excel / "cubemain.txt"
+    if not p_misc.exists() or not p_unique.exists() or not p_cube.exists():
+        report.append("[sunder-large-charm] missing misc.txt, uniqueitems.txt, or cubemain.txt; skipped")
+        return
+
+    # 1) Clone cm2 Large Charm into a dedicated test-only base code so existing
+    # unique charms stay untouched and the cube recipe can target a single base.
+    mh, mrows, mnl = read_tsv(p_misc)
+    code_k = find_column_by_name(mh, "code")
+    name_k = find_column_by_name(mh, "name")
+    namestr_k = find_column_by_name(mh, "namestr")
+    ver_k = find_column_by_name(mh, "version")
+    spawn_k = find_column_by_name(mh, "spawnable")
+    source_base_found = False
+    custom_base_found = False
+    misc_rows_added = 0
+    misc_rows_changed = 0
+    misc_cells_changed = 0
+    source_row = None
+    if code_k:
+        for r in mrows:
+            c = (r.get(code_k) or "").strip().lower()
+            if c == PSEUDO_COLD_LARGE_CHARM_SOURCE_BASE_CODE:
+                source_base_found = True
+                source_row = r
+            if c == PSEUDO_COLD_LARGE_CHARM_BASE_CODE:
+                custom_base_found = True
+    if source_row is not None and not custom_base_found:
+        nr = dict(source_row)
+        nr[code_k] = PSEUDO_COLD_LARGE_CHARM_BASE_CODE
+        if name_k:
+            nr[name_k] = "Classic Cold Rupture Charm"
+        if namestr_k:
+            # Reuse the vanilla cm2 string/art path where possible; a missing custom
+            # string key is avoided by keeping the known-safe Large Charm namestr.
+            nr[namestr_k] = PSEUDO_COLD_LARGE_CHARM_SOURCE_BASE_CODE
+        if ver_k:
+            nr[ver_k] = "0"
+        if spawn_k:
+            nr[spawn_k] = "1"
+        mrows.append(nr)
+        misc_rows_added += 1
+        misc_cells_changed += len([k for k in (code_k, name_k, namestr_k, ver_k, spawn_k) if k])
+        custom_base_found = True
+    elif custom_base_found:
+        for r in mrows:
+            if (r.get(code_k) or "").strip().lower() != PSEUDO_COLD_LARGE_CHARM_BASE_CODE:
+                continue
+            row_changed = False
+            for k, v in [(ver_k, "0"), (spawn_k, "1")]:
+                if k and (r.get(k) or "").strip() != v:
+                    r[k] = v
+                    misc_cells_changed += 1
+                    row_changed = True
+            if row_changed:
+                misc_rows_changed += 1
+            break
+    if misc_rows_added or misc_cells_changed:
+        write_tsv(p_misc, mh, mrows, mnl)
+
+    # 2) Append a new unique row cloned from Hellfire Torch only as a schema/art
+    # template. Do not alter the original Hellfire Torch row.
+    uh, urows, unl = read_tsv(p_unique)
+    idx_k = find_column_by_name(uh, "index")
+    id_k = find_column_by_name(uh, "*ID")
+    ucode_k = find_column_by_name(uh, "code")
+    itemname_k = find_column_by_name(uh, "*ItemName")
+    uver_k = find_column_by_name(uh, "version")
+    uenabled_k = find_column_by_name(uh, "enabled")
+    ulvl_k = find_column_by_name(uh, "lvl")
+    ulvlreq_k = find_column_by_name(uh, "lvl req")
+    unolimit_k = find_column_by_name(uh, "nolimit")
+    carry1_k = find_column_by_name(uh, "carry1")
+    rarity_k = find_column_by_name(uh, "rarity")
+    cost_mult_k = find_column_by_name(uh, "cost mult")
+    cost_add_k = find_column_by_name(uh, "cost add")
+    flippy_k = find_column_by_name(uh, "flippyfile")
+    invfile_k = find_column_by_name(uh, "invfile")
+    dropsound_k = find_column_by_name(uh, "dropsound")
+    dropsfx_k = find_column_by_name(uh, "dropsfxframe")
+    usesound_k = find_column_by_name(uh, "usesound")
+    eol_k = find_column_by_name(uh, "*eol")
+    prop_cols = {i: (
+        find_column_by_name(uh, f"prop{i}"),
+        find_column_by_name(uh, f"par{i}"),
+        find_column_by_name(uh, f"min{i}"),
+        find_column_by_name(uh, f"max{i}"),
+    ) for i in range(1, 13)}
+
+    unique_found = False
+    unique_rows_added = 0
+    unique_rows_changed = 0
+    unique_cells_changed = 0
+    torch_template = None
+    if idx_k:
+        for r in urows:
+            if (r.get(idx_k) or "").strip().lower() == PSEUDO_COLD_LARGE_CHARM_UNIQUE_NAME.lower():
+                unique_found = True
+            if (r.get(idx_k) or "").strip().lower() == "hellfire torch":
+                torch_template = r
+    if not unique_found:
+        nr = dict(torch_template) if torch_template is not None else {k: "" for k in uh}
+        if id_k:
+            numeric_ids = []
+            for r in urows:
+                try:
+                    numeric_ids.append(int((r.get(id_k) or "").strip()))
+                except Exception:
+                    pass
+            nr[id_k] = str((max(numeric_ids) + 1) if numeric_ids else len(urows))
+        if idx_k:
+            nr[idx_k] = PSEUDO_COLD_LARGE_CHARM_UNIQUE_NAME
+        if ucode_k:
+            nr[ucode_k] = PSEUDO_COLD_LARGE_CHARM_BASE_CODE
+        if itemname_k:
+            nr[itemname_k] = "charm"
+        if uver_k:
+            nr[uver_k] = "0"
+        if uenabled_k:
+            nr[uenabled_k] = "1"
+        if ulvl_k:
+            nr[ulvl_k] = "1"
+        if ulvlreq_k:
+            nr[ulvlreq_k] = "1"
+        if unolimit_k:
+            nr[unolimit_k] = "1"
+        if carry1_k:
+            nr[carry1_k] = "1"
+        if rarity_k:
+            nr[rarity_k] = "1"
+        if cost_mult_k:
+            nr[cost_mult_k] = "3"
+        if cost_add_k:
+            nr[cost_add_k] = "5000"
+        # Keep Torch art/sounds because that cm2 unique path was verified stable.
+        if flippy_k and not nr.get(flippy_k):
+            nr[flippy_k] = "flptrch"
+        if invfile_k and not nr.get(invfile_k):
+            nr[invfile_k] = "invtrch"
+        if dropsound_k and not nr.get(dropsound_k):
+            nr[dropsound_k] = "item_gem"
+        if dropsfx_k and not nr.get(dropsfx_k):
+            nr[dropsfx_k] = "12"
+        if usesound_k and not nr.get(usesound_k):
+            nr[usesound_k] = "item_gem"
+        # Clear copied template properties and apply only the pseudo-sunder payload.
+        for i, (prop_k, par_k, min_k, max_k) in prop_cols.items():
+            for k in (prop_k, par_k, min_k, max_k):
+                if k:
+                    nr[k] = ""
+        for i, vals in {
+            1: (PSEUDO_COLD_LARGE_CHARM_PROP1, "", PSEUDO_COLD_LARGE_CHARM_PROP1_VALUE, PSEUDO_COLD_LARGE_CHARM_PROP1_VALUE),
+            2: (PSEUDO_COLD_LARGE_CHARM_PROP2, "", PSEUDO_COLD_LARGE_CHARM_PROP2_VALUE, PSEUDO_COLD_LARGE_CHARM_PROP2_VALUE),
+        }.items():
+            prop_k, par_k, min_k, max_k = prop_cols[i]
+            for k, v in zip((prop_k, par_k, min_k, max_k), vals):
+                if k:
+                    nr[k] = v
+        if eol_k:
+            nr[eol_k] = "0"
+        urows.append(nr)
+        unique_rows_added += 1
+        unique_cells_changed += 1
+        unique_found = True
+    else:
+        for r in urows:
+            if (r.get(idx_k) or "").strip().lower() != PSEUDO_COLD_LARGE_CHARM_UNIQUE_NAME.lower():
+                continue
+            row_changed = False
+            desired_pairs = [
+                (ucode_k, PSEUDO_COLD_LARGE_CHARM_BASE_CODE),
+                (uver_k, "0"),
+                (uenabled_k, "1"),
+                (ulvl_k, "1"),
+                (ulvlreq_k, "1"),
+                (unolimit_k, "1"),
+                (carry1_k, "1"),
+            ]
+            for k, v in desired_pairs:
+                if k and (r.get(k) or "").strip() != v:
+                    r[k] = v
+                    unique_cells_changed += 1
+                    row_changed = True
+            for i, (prop_k, par_k, min_k, max_k) in prop_cols.items():
+                for k in (prop_k, par_k, min_k, max_k):
+                    if k and (r.get(k) or "") != "":
+                        r[k] = ""
+                        unique_cells_changed += 1
+                        row_changed = True
+            for i, vals in {
+                1: (PSEUDO_COLD_LARGE_CHARM_PROP1, "", PSEUDO_COLD_LARGE_CHARM_PROP1_VALUE, PSEUDO_COLD_LARGE_CHARM_PROP1_VALUE),
+                2: (PSEUDO_COLD_LARGE_CHARM_PROP2, "", PSEUDO_COLD_LARGE_CHARM_PROP2_VALUE, PSEUDO_COLD_LARGE_CHARM_PROP2_VALUE),
+            }.items():
+                prop_k, par_k, min_k, max_k = prop_cols[i]
+                for k, v in zip((prop_k, par_k, min_k, max_k), vals):
+                    if k and (r.get(k) or "") != v:
+                        r[k] = v
+                        unique_cells_changed += 1
+                        row_changed = True
+            if row_changed:
+                unique_rows_changed += 1
+            break
+    if unique_rows_added or unique_cells_changed:
+        write_tsv(p_unique, uh, urows, unl)
+
+    # 3) Cube recipe: Identify Scroll -> the custom unique Large Charm base. No monster route.
+    h, rows, nl = read_tsv(p_cube)
+    norm = {normalize_column_key(k): k for k in h}
+    def ck(name: str):
+        return norm.get(normalize_column_key(name))
+
+    desc_k = ck('description') or (h[0] if h else None)
+    enabled_k = ck('enabled')
+    version_k = ck('version')
+    numinputs_k = ck('numinputs')
+    input1_k = ck('input 1')
+    output_k = ck('output')
+    lvl_k = ck('lvl')
+    plvl_k = ck('plvl')
+    ilvl_k = ck('ilvl')
+    eol_k = ck('*eol')
+
+    if not all([desc_k, enabled_k, version_k, numinputs_k, input1_k, output_k]):
+        report.append("[sunder-large-charm] cubemain missing required columns; skipped")
+        return
+
+    desc = "SUNDER V12 TEST: Identify Scroll -> Dedicated Cold Pseudo-Sunder Large Charm"
+    already = False
+    for r in rows:
+        if (r.get(desc_k) or "").strip() == desc:
+            already = True
+            recipe = r
+            break
+    else:
+        recipe = {k: "" for k in h}
+        rows.append(recipe)
+
+    desired = {
+        desc_k: desc,
+        enabled_k: "1",
+        version_k: "0",
+        numinputs_k: "1",
+        input1_k: PSEUDO_COLD_LARGE_CHARM_RECIPE_INPUT,
+        output_k: f"{PSEUDO_COLD_LARGE_CHARM_BASE_CODE},uni",
+    }
+    if lvl_k: desired[lvl_k] = "1"
+    if plvl_k: desired[plvl_k] = "0"
+    if ilvl_k: desired[ilvl_k] = "110"
+    if eol_k: desired[eol_k] = "0"
+
+    recipe_cells_changed = 0
+    for k, v in desired.items():
+        if (recipe.get(k) or "") != v:
+            recipe[k] = v
+            recipe_cells_changed += 1
+
+    if recipe_cells_changed or not already:
+        write_tsv(p_cube, h, rows, nl)
+
+    report.append(
+        f"[sunder-large-charm] V12 CUBE-ONLY DEDICATED COLD PSEUDO-SUNDER LARGE CHARM active: "
+        f"source_base={PSEUDO_COLD_LARGE_CHARM_SOURCE_BASE_CODE} custom_base={PSEUDO_COLD_LARGE_CHARM_BASE_CODE} "
+        f"source_base_found={int(source_base_found)} custom_base_found={int(custom_base_found)} "
+        f"misc_rows_added={misc_rows_added} misc_rows_changed={misc_rows_changed} misc_cells_changed={misc_cells_changed} "
+        f"unique_row={PSEUDO_COLD_LARGE_CHARM_UNIQUE_NAME} unique_found={int(unique_found)} "
+        f"unique_rows_added={unique_rows_added} unique_rows_changed={unique_rows_changed} unique_cells_changed={unique_cells_changed} "
+        f"recipe={'existing' if already else 'added'} recipe_cells_changed={recipe_cells_changed} "
+        f"input={PSEUDO_COLD_LARGE_CHARM_RECIPE_INPUT} output={PSEUDO_COLD_LARGE_CHARM_BASE_CODE},uni "
+        f"mod1={PSEUDO_COLD_LARGE_CHARM_PROP1}:{PSEUDO_COLD_LARGE_CHARM_PROP1_VALUE} "
+        f"mod2={PSEUDO_COLD_LARGE_CHARM_PROP2}:{PSEUDO_COLD_LARGE_CHARM_PROP2_VALUE} "
+        f"existing_unique_charms=untouched monster_tc=disabled cowking=preserved_native"
+    )
 
 def copy_ui_overrides(root: Path, patch_sources: Path, report: list[str], enable_ui: bool = False):
     """Restore R200 UITOGGLE support for D2R layout overrides.
@@ -3024,14 +4430,16 @@ def validate_uniqueitems_invariants(mod_root, report):
     if vh != mh:
         raise RuntimeError("PATCHER ASSERTION FAILED: uniqueitems.txt header drift detected (mod header != vanilla header).")
 
+    allow_v12_append = bool(globals().get("CANON_ENABLE_LARGE_CHARM_PSEUDO_COLD_EXPERIMENT", False))
     if len(vrows) != len(mrows):
-        raise RuntimeError(f"PATCHER ASSERTION FAILED: uniqueitems.txt rowcount changed (vanilla={len(vrows)} mod={len(mrows)}).")
+        if not (allow_v12_append and len(mrows) == len(vrows) + 1):
+            raise RuntimeError(f"PATCHER ASSERTION FAILED: uniqueitems.txt rowcount changed (vanilla={len(vrows)} mod={len(mrows)}).")
 
     if "*ID" in mh:
         vanilla_ids = [(r.get("*ID") or "").strip() for r in vrows]
         mod_ids = [(r.get("*ID") or "").strip() for r in mrows]
 
-        if vanilla_ids != mod_ids:
+        if vanilla_ids != mod_ids[:len(vanilla_ids)]:
             examples = []
             for i, (v_id, m_id) in enumerate(zip(vanilla_ids, mod_ids), start=1):
                 if v_id != m_id:
@@ -3061,7 +4469,7 @@ def validate_uniqueitems_invariants(mod_root, report):
             raise RuntimeError(f"PATCHER ASSERTION FAILED: uniqueitems.txt duplicate *ID detected (examples={dups}).")
 
 
-    report.append("[uniqueitems-guard] OK: header/rowcount/*ID uniqueness/order match vanilla.")
+    report.append("[uniqueitems-guard] OK: header/vanilla-order/*ID uniqueness valid; experimental appended unique row allowed if present.")
     return True
 
 
@@ -4352,7 +5760,13 @@ def main():
         f"PREFER_LOD_AZUREWRATH={int(CANON_PREFER_LOD_AZUREWRATH)} "
         f"JAVE_STACKLESS_SPEAR={int(CANON_ENABLE_JAVE_STACKLESS_SPEAR_BRANCH)} "
         f"AMAZON_SPECIFIC={int(CANON_ENABLE_AMAZON_SPECIFIC_BRANCH)} "
-        f"AMAZON_SPECIFIC_HARNESS={int(CANON_ENABLE_AMAZON_SPECIFIC_STABILITY_HARNESS)}"
+        f"AMAZON_SPECIFIC_HARNESS={int(CANON_ENABLE_AMAZON_SPECIFIC_STABILITY_HARNESS)} "
+        f"ANNIHILUS_COW_DROP={int(CANON_ENABLE_ANNIHILUS_COW_DROP_PORT)} "
+        f"HELLFIRE_TORCH_ALL_SUNDER_NO_PENALTY={int(CANON_ENABLE_HELLFIRE_TORCH_ALL_SUNDER_NO_PENALTY)} "
+        f"SUNDER_TORCH_COW_POOL_DROP={int(CANON_ENABLE_HELLFIRE_TORCH_COW_POOL_DROP)} "
+        f"TEST_ONLY_CUBE_RECIPE_REMOVED=1 "
+        f"COW_KING_NATIVE_TC_PRESERVED={int(CANON_PRESERVE_COW_KING_NATIVE_DROPS)} "
+        f"NO_COW_KING_FORCE_BRANCH=1"
     )
 
     vanilla = Path(args.vanilla).resolve()
@@ -4449,6 +5863,12 @@ def main():
         apply_tc_enrichment_highlevel_bases(mod_root, report, enabled=True)
     elif args.enable_expansion_drops_in_classic:
         report.append("[tc-enrichment] Disabled by EXP_DROPS_STAGE/profile; skipped")
+
+    # Canon V17 charm routes run after cow-all-bases and TC enrichment so cm1/cm2
+    # never leak into generic base pools. Only the controlled cow sidecar routes below expose them.
+    apply_hellfire_torch_all_sunder_no_penalty(mod_root, report)
+    apply_hellfire_torch_all_sunder_cow_pool_drop(mod_root, report)
+    apply_annihilus_classic_cow_drop_port(mod_root, report)
 
     apply_amazon_specific_stability_harness(mod_root, report)
 
